@@ -17,8 +17,22 @@ export default function Transactions() {
   const [page, setPage] = useState(1)
   const [sort, setSort] = useState('date')
   const [dir, setDir] = useState('DESC')
+  const [showExcluded, setShowExcluded] = useState(false)
+  const [toast, setToast] = useState('')
 
   const perPage = 50
+
+  const showToast = (msg) => {
+    setToast(msg)
+    setTimeout(() => setToast(''), 3500)
+  }
+
+  const postJson = (url, body) =>
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    }).then((r) => r.json())
 
   // Load summary once for filter option lists + amount slider bounds.
   useEffect(() => {
@@ -47,6 +61,7 @@ export default function Transactions() {
     if (category) params.category = category
     if (month) params.month = month
     if (amountCap < maxRange) params.max_amount = amountCap
+    if (!showExcluded) params.excluded = 0 // hide excluded unless toggled on
     api
       .transactions(params)
       .then(setData)
@@ -58,12 +73,12 @@ export default function Transactions() {
     const id = setTimeout(load, 250)
     return () => clearTimeout(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, card, category, month, amountCap, page, sort, dir])
+  }, [q, card, category, month, amountCap, page, sort, dir, showExcluded])
 
   // Reset to page 1 when filters change.
   useEffect(() => {
     setPage(1)
-  }, [q, card, category, month, amountCap, sort, dir])
+  }, [q, card, category, month, amountCap, sort, dir, showExcluded])
 
   const months = summary?.months || []
   const cardOptions = useMemo(() => {
@@ -84,6 +99,17 @@ export default function Transactions() {
     api.recategorize({ id, category: newCat }).then(() => load())
   }
 
+  const onToggleExclude = (t) => {
+    postJson(`/api/transactions/${t.id}/exclude`, { excluded: !t.excluded }).then(() => load())
+  }
+
+  const onAutoMatch = () => {
+    postJson('/api/transactions/auto-exclude-refunds').then((d) => {
+      showToast(`${d.pairs_found || 0} refund pairs excluded`)
+      load()
+    })
+  }
+
   const Th = ({ label, k, right }) => (
     <th
       onClick={() => toggleSort(k)}
@@ -96,6 +122,12 @@ export default function Transactions() {
   return (
     <>
       <PageHeader title="Transactions" subtitle={`${data.total} matching`}>
+        <button
+          onClick={onAutoMatch}
+          className="rounded-md border border-border bg-card px-3 py-1.5 font-sora text-sm text-muted hover:bg-card hover:text-text"
+        >
+          ⟲ Auto-match refunds
+        </button>
         <a
           href={api.exportCsvUrl()}
           className="rounded-md border border-border bg-card px-3 py-1.5 font-sora text-sm text-accent hover:bg-accent/10"
@@ -103,6 +135,12 @@ export default function Transactions() {
           ⬇ Export CSV
         </a>
       </PageHeader>
+
+      {toast && (
+        <div className="mb-4 rounded-md border border-green/50 bg-green/10 px-4 py-2 font-data text-sm text-green">
+          {toast}
+        </div>
+      )}
 
       <Card className="mb-4">
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-4">
@@ -149,6 +187,14 @@ export default function Transactions() {
             className="flex-1"
           />
           <span className="font-data text-sm text-accent">≤ ₹{formatINR(amountCap)}</span>
+          <label className="ml-4 flex items-center gap-2 font-data text-xs text-muted">
+            <input
+              type="checkbox"
+              checked={showExcluded}
+              onChange={(e) => setShowExcluded(e.target.checked)}
+            />
+            Show excluded
+          </label>
         </div>
       </Card>
 
@@ -167,11 +213,17 @@ export default function Transactions() {
                   <Th label="Amount" k="amount" right />
                   <Th label="Card" k="card" />
                   <th className="px-3 py-2 text-left text-xs uppercase tracking-wider text-muted">Category</th>
+                  <th className="px-3 py-2 text-center text-xs uppercase tracking-wider text-muted">Excl</th>
                 </tr>
               </thead>
               <tbody>
-                {data.transactions.map((t) => (
-                  <tr key={t.id} className="border-b border-border/50 hover:bg-bg/40">
+                {data.transactions.map((t) => {
+                  const ex = !!t.excluded
+                  return (
+                  <tr
+                    key={t.id}
+                    className={`border-b border-border/50 hover:bg-bg/40 ${ex ? 'opacity-50 line-through' : ''}`}
+                  >
                     <td className="px-3 py-2 text-left text-sm text-muted">{t.date}</td>
                     <td className="px-3 py-2 text-left font-sora text-sm text-text">{t.description}</td>
                     <td className="px-3 py-2 text-right text-sm text-text">₹{formatINR(t.amount)}</td>
@@ -180,14 +232,24 @@ export default function Transactions() {
                       <select
                         value={CATEGORIES.includes(t.category) ? t.category : 'Miscellaneous'}
                         onChange={(e) => onRecategorize(t.id, e.target.value)}
-                        className="rounded-md border border-border bg-bg px-2 py-1 font-sora text-xs"
+                        className="rounded-md border border-border bg-bg px-2 py-1 font-sora text-xs no-underline"
                         style={{ color: colorFor(t.category) }}
                       >
                         {CATEGORIES.map((c) => (<option key={c} value={c}>{c}</option>))}
                       </select>
                     </td>
+                    <td className="px-3 py-2 text-center">
+                      <button
+                        onClick={() => onToggleExclude(t)}
+                        title={ex ? 'Excluded — click to include' : 'Click to exclude from totals'}
+                        className={`text-base leading-none ${ex ? 'text-red' : 'text-muted hover:text-text'}`}
+                      >
+                        {ex ? '●' : '○'}
+                      </button>
+                    </td>
                   </tr>
-                ))}
+                  )
+                })}
               </tbody>
             </table>
           </div>

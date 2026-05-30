@@ -122,12 +122,14 @@ def get_transactions(
     per_page: int = Query(50, ge=1, le=1000),
     sort: str = Query("date"),
     dir: str = Query("DESC"),
+    excluded: int = Query(None),
 ):
     offset = (page - 1) * per_page
     rows, total = db.query_transactions(
         card=card, category=category, month=month, q=q,
         min_amount=min_amount, max_amount=max_amount,
         limit=per_page, offset=offset, order_by=sort, order_dir=dir,
+        excluded=excluded,
     )
     return {
         "transactions": rows,
@@ -136,6 +138,26 @@ def get_transactions(
         "per_page": per_page,
         "pages": (total + per_page - 1) // per_page if per_page else 1,
     }
+
+
+class ExcludeBody(BaseModel):
+    excluded: bool = True
+
+
+@app.post("/api/transactions/{txn_id}/exclude")
+def post_exclude(txn_id: int, body: ExcludeBody):
+    """Exclude/include a transaction from all dashboard aggregates."""
+    n = db.toggle_excluded(txn_id, body.excluded)
+    if n == 0:
+        raise HTTPException(status_code=404, detail="transaction not found")
+    return {"ok": True, "id": txn_id, "excluded": body.excluded}
+
+
+@app.post("/api/transactions/auto-exclude-refunds")
+def post_auto_exclude_refunds():
+    """Auto-match debit/credit refund pairs and exclude both sides."""
+    pairs = db.auto_match_refunds()
+    return {"ok": True, "pairs_found": pairs}
 
 
 @app.get("/api/categories")
@@ -552,7 +574,7 @@ def post_parse():
 
 @app.get("/api/export/csv")
 def export_csv():
-    txns = db.all_transactions()
+    txns = db.all_transactions(include_excluded=True)  # raw dump includes excluded
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["id", "date", "description", "raw_description", "amount",

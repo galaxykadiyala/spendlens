@@ -66,8 +66,10 @@ DETECTION = {
     # carries the generic IDFC markers and acts as the default IDFC card.
     "IDFC Select":       ["FIRST SELECT CREDIT CARD", "FIRST SELECT"],
     "IDFC Power+":       ["FIRST POWER+", "FIRST POWER PLUS", "POWER PLUS CREDIT CARD",
-                          "XX9359", "9359", "IDFCFIRSTBANK", "IDFCFIRST"],
-    "RBL IndianOil":     ["INDIANOIL RBL", "RBL BANK", "XTRA CREDIT"],
+                          "XX9359", "IDFCFIRSTBANK", "IDFCFIRST"],
+    # Plain RBL card checked before the IndianOil co-brand (more specific marker).
+    "RBL Bank":          ["RBL BANK CREDIT CARD"],
+    "RBL IndianOil":     ["INDIANOIL RBL", "XTRA CREDIT"],
     "Amazon ICICI":      ["AMAZON PAY ICICI", "AMAZON PAY ICICI BANK",
                           "AMAZON PAY CREDIT CARD", "AMAZONPAYCC@ICICIBANK"],
     "IndusInd":          ["INDUSIND BANK CREDIT CARD", "INDUSIND BANK"],
@@ -586,8 +588,12 @@ def parse_idfc(pdf, card, statement_year):
 # DR/CR marker, so credits are identified by description keyword. We scope strictly
 # to that section so the page-2 fees/illustration tables (2018-2019 sample rows)
 # are never parsed as real transactions.
-_RBL_DATE_RE = re.compile(r'^(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\b')
-_RBL_AMOUNT_RE = re.compile(r'([\d,]+\.\d{2})\s*$')
+# RBL's two-column layout concatenates the transaction onto the account-summary
+# line, so the date sits mid-line, e.g.
+#   "Total Amount Due PAY NOW 4,184.00 3 May 2026 SREE KODANDARAMA SERV ... 4,184.12"
+# We search for "DD Mon YYYY <desc> <amount>" with the amount anchored at the end
+# (the trailing INR amount), ignoring any summary figure before the date.
+_RBL_TXN_RE = re.compile(r'(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s*$')
 _RBL_START = "the month gone by"
 _RBL_STOP = ("eligible for emi", "your spending pattern", "look out for exclusive",
              "reward summary")
@@ -624,20 +630,16 @@ def parse_rbl(pdf, card, statement_year):
                 continue
             if low.startswith("date") and "description" in low:
                 continue  # column header
-            m = _RBL_DATE_RE.match(s)
+            m = _RBL_TXN_RE.search(s)
             if not m:
                 continue
             date = parse_date(m.group(1), statement_year)
             if not date:
                 continue
-            rest = s[m.end():].strip()
-            am = _RBL_AMOUNT_RE.search(rest)
-            if not am:
-                continue
-            amount = float(am.group(1).replace(",", ""))
+            amount = float(m.group(3).replace(",", ""))
             if amount <= 0:
                 continue
-            desc = clean_description(rest[:am.start()])
+            desc = clean_description(m.group(2))
             if not desc or any(k in desc.lower() for k in _RBL_SKIP):
                 continue
             rows.append({
@@ -757,6 +759,7 @@ _SC_SKIP_KEYWORDS = [
     "bill desk payment", "cidnum",  # payment reference
     "making only the minimum", "disclaimer", "most important terms",
     "date description",  # header row
+    "igst",  # tax line (e.g. 'IGST @ 18.00%')
 ]
 
 # Merchant-prefix noise to strip from SC descriptions (longest/most specific first).
@@ -793,76 +796,117 @@ def _clean_stanchart_desc(raw):
     return raw.strip()
 
 
-def parse_stanchart(pdf, card, statement_year):
-    """Standard Chartered Ultimate. Text/line based; INR (last) amount; skips CR.
+# A transaction-section header naming the active sub-card, e.g.
+#   "Ultimate Mastercard 544438XXXXXX2349"
+_SC_CARD_HEADER_RE = re.compile(r'Ultimate Mastercard\s+(5\d{5}[Xx]+\d{4})', re.IGNORECASE)
+# A REWARDS POINTS SUMMARY row, e.g.
+#   "544438XXXXXX6700 Ultimate Mastercard points 95982.00 1362.00 0.00 97344.00 0.00"
+_SC_SUMMARY_RE = re.compile(
+    r'(\d{6}[Xx]+\d{4})\s+(.+?)\s+points\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)',
+    re.IGNORECASE,
+)
 
-    Stops at the "Rewards Points Summary" section. Uses the open pdf object and
-    iterates all pages; never opens a new handle.
+
+def parse_stanchart(pdf, card, statement_year):
+    """Standard Chartered Ultimate (one account, possibly two sub-cards).
+
+    Two-pass over all lines: phase 1 extracts transactions (attributing each to
+    the active sub-card number), phase 2 reads the REWARDS POINTS SUMMARY table.
+    Returns ``(transactions, rewards_list)`` where rewards_list has one entry per
+    sub-card. INR (last) amount; CR rows skipped.
     """
     transactions = []
+    rewards_list = []
     stop_parsing = False
+    in_rewards_summary = False
+    current_card_number = ""
 
+    all_lines = []
     for page in pdf.pages:
-        if stop_parsing:
-            break
         try:
             text = page.extract_text() or ""
         except Exception as exc:
             logger.debug("%s: text extraction failed on a page: %s", card, exc)
             continue
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        all_lines.extend(l.strip() for l in text.split("\n") if l.strip())
 
-        for line in lines:
-            line_lower = line.lower()
+    for line in all_lines:
+        line_lower = line.lower()
 
-            # Everything from the rewards summary onward is not transactions.
-            if "rewards points summary" in line_lower:
-                stop_parsing = True
-                break
+        if "rewards points summary" in line_lower:
+            stop_parsing = True
+            in_rewards_summary = True
+            continue
 
-            if any(kw in line_lower for kw in _SC_SKIP_KEYWORDS):
-                continue
+        if in_rewards_summary:
+            sm = _SC_SUMMARY_RE.match(line)
+            if sm:
+                rewards_list.append({
+                    "card_number": sm.group(1),
+                    "card_name": sm.group(2).strip(),
+                    "opening_balance": int(float(sm.group(3))),
+                    "earned": int(float(sm.group(4))),
+                    "redeemed": int(float(sm.group(5))),
+                    "closing_balance": int(float(sm.group(6))),
+                })
+            continue
 
-            # Skip credits / payments / cashbacks (amount ends in CR).
-            if re.search(r'\bCR\s*$', line):
-                continue
+        if stop_parsing:
+            continue
 
-            m = _SC_ROW_RE.match(line)
-            if not m:
-                continue
-            date_str, desc_raw, amount_str = m.groups()
+        # Transaction section header names the active sub-card.
+        hdr = _SC_CARD_HEADER_RE.search(line)
+        if hdr:
+            current_card_number = hdr.group(1)
+            continue
 
-            date = _parse_stanchart_date(date_str)
-            if not date:
-                continue
+        if any(kw in line_lower for kw in _SC_SKIP_KEYWORDS):
+            continue
+        # Skip credits / payments / cashbacks (amount ends in CR).
+        if re.search(r'\bCR\s*$', line):
+            continue
 
-            # Strip the trailing columns that sit between description and INR amount:
-            # transaction reference (long digit run), then rewards earned + type.
-            desc_raw = re.sub(r'\s+\d{20,}\s+', ' ', desc_raw)
-            desc_raw = re.sub(r'\s+\d{1,4}\s+\d{3}\s*$', '', desc_raw)
-            desc_raw = re.sub(r'\s+\d{3}\s*$', '', desc_raw).strip()
+        m = _SC_ROW_RE.match(line)
+        if not m:
+            continue
+        date_str, desc_raw, amount_str = m.groups()
 
-            desc = _clean_stanchart_desc(desc_raw)
-            if not desc or re.match(r'^\d+$', desc):
-                continue
+        date = _parse_stanchart_date(date_str)
+        if not date:
+            continue
 
-            amount, is_credit = parse_amount(amount_str)
-            if is_credit or amount <= 0:
-                continue
+        # Strip the columns between description and INR amount: transaction
+        # reference (long digit run), rewards earned + type, and the
+        # "<N> points [USD x.xx]" / "0" reward fragments.
+        desc_raw = re.sub(r'\s+\d{20,}\s+', ' ', desc_raw)
+        desc_raw = re.sub(r'\s+\d{1,4}\s+\d{3}\s*$', '', desc_raw)
+        desc_raw = re.sub(r'\s+\d{3}\s*$', '', desc_raw)
+        desc_raw = re.sub(r'\s+\d+\s+points(?:\s+USD\s+[\d.]+)?\s*$', '', desc_raw,
+                          flags=re.IGNORECASE)
+        desc_raw = re.sub(r'\s+0\s*$', '', desc_raw).strip()
 
-            # Belt-and-braces: drop known non-spend rows by description.
-            if any(kw in desc.lower() for kw in ("bill desk", "cidnum", "fuel surcharge reversal")):
-                continue
+        desc = _clean_stanchart_desc(desc_raw)
+        if not desc or re.match(r'^\d+$', desc):
+            continue
 
-            transactions.append({
-                "date": date,
-                "description": desc,
-                "raw_description": line,
-                "amount": amount,
-                "card": card,
-            })
+        amount, is_credit = parse_amount(amount_str)
+        if is_credit or amount <= 0:
+            continue
 
-    return dedup(transactions)
+        # Belt-and-braces: drop known non-spend rows by description.
+        if any(kw in desc.lower() for kw in ("bill desk", "cidnum", "fuel surcharge reversal")):
+            continue
+
+        transactions.append({
+            "date": date,
+            "description": desc,
+            "raw_description": line,
+            "amount": amount,
+            "card": card,
+            "card_number": current_card_number,
+        })
+
+    return dedup(transactions), rewards_list
 
 
 # --------------------------------------------------------------------------- #
@@ -987,6 +1031,7 @@ CARD_PARSER = {
     "HSBC Live+": parse_hsbc,
     "IDFC Power+": parse_idfc,
     "IDFC Select": parse_idfc,
+    "RBL Bank": parse_rbl,
     "RBL IndianOil": parse_rbl,
     "Amazon ICICI": parse_icici,
     "IndusInd": parse_indusind,
@@ -1208,6 +1253,36 @@ def _month_from_transactions(txns):
     return max(months) if months else ""
 
 
+# A description that is just a date, optionally prefixed with "To" (statement
+# period fragments like "To 04 MAR 2026" / "04 Mar 2026" / "21/01/26").
+_NOISE_DATE_RE = re.compile(
+    r'^(?:to\s+)?\d{1,2}[\s/.\-]+(?:[a-z]{3,9}|\d{1,2})[\s/.\-]+\d{2,4}$', re.IGNORECASE
+)
+# Balance / summary phrases that are never real spends.
+_NOISE_SUBSTR = (
+    "net outstanding", "outstanding balance", "opening balance", "closing balance",
+    "previous balance", "balance carried", "net amount due",
+)
+
+
+def _is_noise_desc(desc):
+    """True for non-merchant artifacts that leak from summary/footer rows:
+    account balances, statement-period dates, 'Convert' EMI flags, and stray
+    statement-text fragments. Applied to every parsed transaction."""
+    if not desc:
+        return True
+    low = desc.strip().lower()
+    if low in ("convert", "convert to emi", "balance"):
+        return True
+    if any(k in low for k in _NOISE_SUBSTR):
+        return True
+    if _NOISE_DATE_RE.match(low):
+        return True
+    if re.match(r'^[a-z]{1,3}\s+statement$', low):  # 'il statement', 'ch statement'
+        return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # Detection + dispatch
 # --------------------------------------------------------------------------- #
@@ -1248,13 +1323,20 @@ def detect_and_parse(pdf_path):
         full_text = "\n".join(full)
         statement_year = _statement_year_from_text(head)
         parser_fn = CARD_PARSER.get(card, parse_generic)
-        raw_rows = parser_fn(pdf, card, statement_year)
+        # Standard Chartered returns (transactions, rewards_list); others a list.
+        sc_rewards_list = []
+        if card == "Standard Chartered Ultimate":
+            raw_rows, sc_rewards_list = parser_fn(pdf, card, statement_year)
+        else:
+            raw_rows = parser_fn(pdf, card, statement_year)
     # pdf is closed here.
 
     source_file = os.path.basename(pdf_path)
     txns = []
     for r in raw_rows:
         desc = r["description"]
+        if _is_noise_desc(desc):  # drop balances, statement dates, 'Convert' flags
+            continue
         cat = categorizer.categorize(desc)
         txns.append({
             "date": r["date"],
@@ -1266,10 +1348,26 @@ def detect_and_parse(pdf_path):
             "confidence": cat["confidence"],
             "suggested_category": "",
             "source_file": source_file,
+            "card_number": r.get("card_number", ""),
         })
 
-    # Reward points (never fails the parse).
-    rewards = _extract_rewards(card, full_text)
+    # Reward points (never fails the parse). SC combines its per-sub-card rows
+    # into one account-level summary; other banks use the text extractors.
+    if card == "Standard Chartered Ultimate":
+        if sc_rewards_list:
+            rewards = {
+                "opening_balance": sum(r["opening_balance"] for r in sc_rewards_list),
+                "earned": sum(r["earned"] for r in sc_rewards_list),
+                "redeemed": sum(r["redeemed"] for r in sc_rewards_list),
+                "closing_balance": sum(r["closing_balance"] for r in sc_rewards_list),
+                "earned_fuel": 0, "earned_grocery": 0, "earned_upi": 0,
+                "earned_other": sum(r["earned"] for r in sc_rewards_list),
+                "card_breakdown": sc_rewards_list,
+            }
+        else:
+            rewards = None
+    else:
+        rewards = _extract_rewards(card, full_text)
     if rewards is not None:
         month = _statement_month_from_text(full_text) or _month_from_transactions(txns)
         rewards["statement_month"] = month

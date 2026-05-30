@@ -28,7 +28,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     source_file TEXT,
     parsed_at TEXT,
     confidence REAL DEFAULT 0.0,
-    suggested_category TEXT DEFAULT ""
+    suggested_category TEXT DEFAULT "",
+    card_number TEXT DEFAULT "",
+    is_credit INTEGER DEFAULT 0,
+    excluded INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS category_overrides (pattern TEXT PRIMARY KEY, category TEXT);
@@ -82,6 +85,9 @@ def connect():
 _MIGRATIONS = [
     ("confidence", "confidence REAL DEFAULT 0.0"),
     ("suggested_category", 'suggested_category TEXT DEFAULT ""'),
+    ("card_number", 'card_number TEXT DEFAULT ""'),
+    ("is_credit", "is_credit INTEGER DEFAULT 0"),
+    ("excluded", "excluded INTEGER DEFAULT 0"),
 ]
 
 
@@ -228,8 +234,8 @@ def insert_transactions(rows):
         parsed_at = datetime.now().isoformat(timespec="seconds")
         conn.executemany(
             "INSERT INTO transactions "
-            "(date, description, raw_description, amount, card, category, source_file, parsed_at, confidence, suggested_category) "
-            "VALUES (:date, :description, :raw_description, :amount, :card, :category, :source_file, :parsed_at, :confidence, :suggested_category)",
+            "(date, description, raw_description, amount, card, category, source_file, parsed_at, confidence, suggested_category, card_number) "
+            "VALUES (:date, :description, :raw_description, :amount, :card, :category, :source_file, :parsed_at, :confidence, :suggested_category, :card_number)",
             [
                 {
                     "date": r.get("date"),
@@ -242,6 +248,7 @@ def insert_transactions(rows):
                     "parsed_at": parsed_at,
                     "confidence": float(r.get("confidence", 0.0) or 0.0),
                     "suggested_category": r.get("suggested_category", "") or "",
+                    "card_number": r.get("card_number", "") or "",
                 }
                 for r in rows
             ],
@@ -357,13 +364,17 @@ def low_confidence_transactions(threshold=0.0):
 
 def query_transactions(card=None, category=None, month=None, q=None,
                        min_amount=None, max_amount=None, limit=None, offset=0,
-                       order_by="date", order_dir="DESC"):
+                       order_by="date", order_dir="DESC", excluded=None):
     """Flexible transaction query. Returns (rows, total_count).
 
     `month` is matched as a YYYY-MM prefix on the ISO date string.
+    `excluded`: None → no filter (show all); 0 → only active; 1 → only excluded.
     """
     where = []
     params = []
+    if excluded is not None:
+        where.append("excluded = ?")
+        params.append(int(excluded))
     if card:
         where.append("card = ?")
         params.append(card)
@@ -411,10 +422,83 @@ def query_transactions(card=None, category=None, month=None, q=None,
         conn.close()
 
 
-def all_transactions():
-    """Return every transaction ordered by date (used for CSV export/aggregates)."""
-    rows, _ = query_transactions(order_by="date", order_dir="ASC")
+def all_transactions(include_excluded=False):
+    """Return transactions ordered by date (used for aggregates / CSV export).
+
+    Excludes ``excluded = 1`` rows by default so all dashboard aggregates ignore
+    them; pass ``include_excluded=True`` for a complete raw dump.
+    """
+    rows, _ = query_transactions(order_by="date", order_dir="ASC",
+                                 excluded=None if include_excluded else 0)
     return rows
+
+
+def toggle_excluded(txn_id, excluded):
+    """Set the excluded flag (bool) on a transaction. Returns rows affected."""
+    conn = connect()
+    try:
+        cur = conn.execute(
+            "UPDATE transactions SET excluded = ? WHERE id = ?",
+            (1 if excluded else 0, txn_id),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def auto_match_refunds():
+    """Exclude refund pairs: a debit and a same-amount credit on the same card
+    within 30 days. Marks both ``excluded = 1`` and returns the number of pairs.
+
+    Pairing requires credit rows (``is_credit = 1``). The PDF parsers currently
+    skip credit lines, so on a debit-only dataset this finds 0 pairs until
+    credits are captured.
+    """
+    from datetime import datetime
+
+    def _d(s):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            return None
+
+    conn = connect()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, date, amount, card, is_credit FROM transactions WHERE excluded = 0"
+        ).fetchall()]
+
+        from collections import defaultdict
+        groups = defaultdict(lambda: {"debit": [], "credit": []})
+        for r in rows:
+            key = (r["card"], round(r["amount"] or 0, 2))
+            groups[key]["credit" if r["is_credit"] else "debit"].append(r)
+
+        to_exclude = set()
+        pairs = 0
+        for g in groups.values():
+            used_debits = set()
+            for cr in g["credit"]:
+                cd = _d(cr["date"])
+                for db_row in g["debit"]:
+                    if db_row["id"] in used_debits:
+                        continue
+                    dd = _d(db_row["date"])
+                    if cd and dd and abs((cd - dd).days) <= 30:
+                        used_debits.add(db_row["id"])
+                        to_exclude.add(cr["id"])
+                        to_exclude.add(db_row["id"])
+                        pairs += 1
+                        break
+
+        if to_exclude:
+            conn.executemany("UPDATE transactions SET excluded = 1 WHERE id = ?",
+                             [(i,) for i in to_exclude])
+            conn.commit()
+        return pairs
+    finally:
+        conn.close()
 
 
 # --------------------------------------------------------------------------- #

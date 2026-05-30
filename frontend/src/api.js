@@ -42,6 +42,9 @@ export const CATEGORY_COLORS = {
   Kids: '#4ade80',
   Insurance: '#818cf8',
   Investments: '#2dd4bf',
+  Travel: '#0ea5e9',
+  Rent: '#e879f9',
+  Jewellery: '#eab308',
   'Fees & Charges': '#f87171',
   Miscellaneous: '#64748b',
 }
@@ -49,9 +52,9 @@ export const CATEGORY_COLORS = {
 // Full category list (mirrors backend categorizer rules) for inline editing.
 export const CATEGORIES = [
   'Fuel', 'Groceries', 'Food Delivery', 'Food & Dining', 'Medical', 'Education',
-  'Shopping', 'Health & Wellness', 'Transport', 'Bills & Utilities', 'Subscriptions',
-  'Personal Care', 'Household Help', 'Entertainment', 'Kids', 'Insurance',
-  'Investments', 'Fees & Charges', 'Miscellaneous',
+  'Shopping', 'Jewellery', 'Health & Wellness', 'Transport', 'Travel', 'Bills & Utilities',
+  'Subscriptions', 'Personal Care', 'Household Help', 'Entertainment', 'Kids',
+  'Insurance', 'Investments', 'Rent', 'Fees & Charges', 'Miscellaneous',
 ]
 
 export const PALETTE = [

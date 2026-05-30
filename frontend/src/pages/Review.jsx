@@ -19,13 +19,16 @@ export default function Review() {
       .reviewQueue()
       .then((d) => {
         setQueue(d.transactions)
-        // Pre-select suggested_category if present, else first category.
+        // Pre-select the suggestion if present, else keep the current category
+        // (so "Save All" without edits is a safe no-op, not a mass-relabel).
         const init = {}
         d.transactions.forEach((t) => {
           init[t.id] =
             t.suggested_category && CATEGORIES.includes(t.suggested_category)
               ? t.suggested_category
-              : CATEGORIES[0]
+              : CATEGORIES.includes(t.category)
+              ? t.category
+              : 'Miscellaneous'
         })
         setChoices(init)
         setConfirmed({})
@@ -146,7 +149,7 @@ export default function Review() {
 
               <div className="mt-3 flex items-center gap-3">
                 <select
-                  value={choices[t.id] || CATEGORIES[0]}
+                  value={choices[t.id] || 'Miscellaneous'}
                   onChange={(e) => setChoice(t.id, e.target.value)}
                   className="flex-1 rounded-md border border-border bg-bg px-3 py-2 font-sora text-sm text-text"
                 >

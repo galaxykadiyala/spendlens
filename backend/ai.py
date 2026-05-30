@@ -8,6 +8,7 @@ logged or printed.
 """
 
 import os
+import re
 import json
 import logging
 
@@ -58,11 +59,20 @@ Format: [{{"description": "merchant", "category": "category", "confidence": 0.85
         client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
         message = client.messages.create(
             model=MODEL,
-            max_tokens=1024,
+            max_tokens=8192,  # 1024 truncated 50-merchant JSON arrays → parse errors
             messages=[{"role": "user", "content": prompt}],
         )
         text = message.content[0].text
-        return json.loads(text)
+        raw = (text or "").strip()
+        # Strip markdown code fences Claude sometimes adds.
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\s*```\s*$', '', raw, flags=re.MULTILINE)
+        raw = raw.strip()
+        if not raw:
+            logger.warning("Empty response from Claude API — skipping batch")
+            return []
+        data = json.loads(raw)
+        return data
     except Exception as exc:
         # Never surface the key; log only the error type/message.
         logger.error("Claude suggestion call failed: %s", exc)

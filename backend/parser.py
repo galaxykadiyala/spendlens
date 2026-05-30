@@ -68,10 +68,12 @@ DETECTION = {
     "IDFC Power+":       ["FIRST POWER+", "FIRST POWER PLUS", "POWER PLUS CREDIT CARD",
                           "XX9359", "9359", "IDFCFIRSTBANK", "IDFCFIRST"],
     "RBL IndianOil":     ["INDIANOIL RBL", "RBL BANK", "XTRA CREDIT"],
-    "Amazon ICICI":      ["AMAZON PAY ICICI", "AMAZON PAY ICICI BANK"],
+    "Amazon ICICI":      ["AMAZON PAY ICICI", "AMAZON PAY ICICI BANK",
+                          "AMAZON PAY CREDIT CARD", "AMAZONPAYCC@ICICIBANK"],
     "IndusInd":          ["INDUSIND BANK CREDIT CARD", "INDUSIND BANK"],
     "Axis Amex":         ["AXIS BANK AMEX", "AXIS BANK"],
-    "Standard Chartered": ["STANDARD CHARTERED"],
+    "Standard Chartered Ultimate": ["STANDARD CHARTERED", "STANCHART",
+                                    "ULTIMATE MASTERCARD", "SC.COM/IN"],
 }
 
 
@@ -332,66 +334,134 @@ def parse_hsbc(pdf, card, statement_year):
 
 # Header/summary/credit keywords that must never be treated as IDFC spends.
 _IDFC_SKIP_KEYWORDS = [
-    "billdesk", "payment", "opening balance", "closing balance",
-    "total amount", "minimum amount", "payments & refunds", "purchases",
-    "first power", "reward", "emi", "available", "statement period",
-    "joining fee", "annual fee", "igst assessment", "interest rate",
-    "congratulations", "please note", "card number", "relationship",
+    "billdesk", "payment/dp", "opening balance", "closing balance",
+    "total amount", "minimum amount", "payments & other credits",
+    "purchases, emis", "reward", "emi", "available credit",
+    "statement period", "joining fee", "annual fee", "igst assessment",
+    "interest rate", "congratulations", "please note", "card number",
+    "relationship no", "transaction date", "transaction details",
+    "share your credit", "refer this", "convert your", "apply now",
+    "special benefits", "important information", "insurance details",
+    "schedule of charges", "grievance", "your card information",
+    "payment modes", "pay via", "pay through", "pay now",
+    "r1,", "r0.", "r13,", "r28,",  # summary amounts with rupee symbol
 ]
 
-# Match: optional date + description + amount + DR/CR (anchored at both ends).
-_IDFC_ROW_RE = re.compile(
-    r'^(\d{1,2}\s+\w{3}\s+\d{2,4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})?\s*'
-    r'(.+?)\s+'
-    r'([\d,]+\.?\d*)\s*(DR|CR)\s*$',
+# A transaction date at the start of a line ("20 Dec 25" or "20/12/2025").
+_IDFC_DATE_RE = re.compile(
+    r'^(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2,4}'
+    r'|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
     re.IGNORECASE,
 )
+# An amount immediately followed by DR (debit) at the end of a line.
+_IDFC_AMOUNT_DR_RE = re.compile(r'([\d,]+\.\d{2})\s+DR\s*$', re.IGNORECASE)
+# An amount followed by DR or CR at the end of a line (any settled amount).
+_IDFC_AMOUNT_ANY_RE = re.compile(r'([\d,]+\.\d{2})\s+(?:DR|CR)\s*$', re.IGNORECASE)
+# A credit (CR) amount at the end of a line — skipped (payments, refunds, fees).
+_IDFC_AMOUNT_CR_RE = re.compile(r'([\d,]+\.\d{2})\s+CR\s*$', re.IGNORECASE)
 
 
 def _parse_idfc_lines(text, card_name, statement_year=None):
-    """Robust line-by-line parser for IDFC statements (Strategy B).
+    """Parse IDFC statement text, reconstructing transactions split across lines.
 
-    IDFC rows look like ``20 Dec 25 SBT FILLING STATION Convert 4,259.68 DR``.
-    Skips credits (CR) and payment/summary/header lines; keeps the merchant in
-    between the leading date and the trailing amount, cleaned via
-    :func:`clean_idfc_description`.
+    IDFC's extracted text wraps long UPI descriptions across 2-3 physical lines,
+    e.g. the date + amount land on their own line while the merchant string is
+    split before and after it::
+
+        UPICC/DR/572105501400/MEDPLUS/HD
+        21 Dec 25 159.00 DR
+        FC/medplus/Paid v
+
+    The anchor is the line carrying both a leading date and a trailing
+    ``amount DR``. When that anchor has no text between the date and the amount,
+    its description is rebuilt from the buffered fragment(s) before it plus the
+    continuation fragment(s) after it. Single-line rows
+    (``20 Dec 25 SBT FILLING STATION Convert 4,259.68 DR``) are handled directly.
+    Credits (CR) and header/summary lines are skipped.
     """
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
     transactions = []
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        if any(kw in line.lower() for kw in _IDFC_SKIP_KEYWORDS):
-            continue
+    pending = []  # buffered description fragments seen before the current anchor
 
-        match = _IDFC_ROW_RE.match(line)
-        if not match:
-            continue
+    def _is_skip(s):
+        low = s.lower()
+        return any(kw in low for kw in _IDFC_SKIP_KEYWORDS)
 
-        date_str, desc, amount_str, dr_cr = match.groups()
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
 
-        if dr_cr.upper() == "CR":
-            continue  # skip credits
-
-        amount, is_credit = parse_amount(amount_str + " " + dr_cr)
-        if is_credit or amount <= 0:
+        # Header / footer / summary line — drop any buffered fragments at the boundary.
+        if _is_skip(line):
+            pending = []
+            i += 1
             continue
 
-        date = parse_date(date_str or "", statement_year=statement_year)
-        if not date:
+        # Credit line (payment, refund, fee waiver) — skip and reset fragments.
+        if _IDFC_AMOUNT_CR_RE.search(line):
+            pending = []
+            i += 1
             continue
 
-        desc = clean_idfc_description(desc.strip())
-        if not desc:
+        dr = _IDFC_AMOUNT_DR_RE.search(line)
+        if dr:
+            remainder = line[:dr.start()].strip()
+            date_m = _IDFC_DATE_RE.match(remainder)
+            if not date_m:
+                # Amount+DR with no leading date — not a usable row on its own.
+                pending = []
+                i += 1
+                continue
+
+            middle = remainder[date_m.end():].strip()
+            middle = re.sub(r'\s+Convert\s*$', '', middle, flags=re.IGNORECASE).strip()
+
+            raw_lines = list(pending)
+            consumed_to = i
+            if middle:
+                # Self-contained row; prepend any buffered fragments (wrapped name).
+                desc_parts = pending + [middle]
+            else:
+                # Split row: gather continuation fragments that follow the anchor.
+                post = []
+                j = i + 1
+                while j < n:
+                    nxt = lines[j]
+                    if _is_skip(nxt) or _IDFC_DATE_RE.match(nxt) or _IDFC_AMOUNT_ANY_RE.search(nxt):
+                        break
+                    post.append(nxt)
+                    j += 1
+                desc_parts = pending + post
+                raw_lines = pending + [line] + post
+                consumed_to = j - 1
+
+            amount = float(dr.group(1).replace(",", ""))
+            date = parse_date(date_m.group(1), statement_year=statement_year)
+            desc = clean_idfc_description(" ".join(p for p in desc_parts if p).strip())
+
+            pending = []
+            i = consumed_to + 1
+
+            if amount <= 0 or not date or not desc:
+                continue
+            # Belt-and-braces: never let a payment/billdesk row through.
+            if any(kw in desc.lower() for kw in ("billdesk", "payment/dp")):
+                continue
+
+            transactions.append({
+                "date": date,
+                "description": desc,
+                "raw_description": " ".join(raw_lines) if raw_lines else line,
+                "amount": amount,
+                "card": card_name,
+            })
             continue
 
-        transactions.append({
-            "date": date,
-            "description": desc,
-            "raw_description": line,
-            "amount": amount,
-            "card": card_name,
-        })
+        # A bare date line (no amount yet) or a plain text fragment: buffer it as
+        # a description fragment for the next anchor.
+        pending.append(line)
+        i += 1
 
     return transactions
 
@@ -435,6 +505,234 @@ def parse_rbl(pdf, card, statement_year):
     return _parse_bank(pdf, card, statement_year, clean_description)
 
 
+# Header/footer/payment lines that are never spends in a SC statement.
+_SC_SKIP_KEYWORDS = [
+    "rewards points summary", "previous balance", "payments/credits",
+    "total payment due", "minimum payment due", "statement date",
+    "statement period", "payment due date", "credit limit", "cash limit",
+    "bill desk payment", "cidnum",  # payment reference
+    "making only the minimum", "disclaimer", "most important terms",
+    "date description",  # header row
+]
+
+# Merchant-prefix noise to strip from SC descriptions (longest/most specific first).
+_SC_PREFIXES = ["PAY*", "RAZ*", "CAS*", "PHP*", "IAP ", "WWW "]
+
+# A SC transaction line: 6-digit date + description + trailing INR amount.
+_SC_ROW_RE = re.compile(r'^(\d{6})\s+(.+?)\s+([\d,]+\.\d{2})\s*$')
+
+
+def _parse_stanchart_date(raw):
+    """Parse SC's DDMMYY format, e.g. ``230326`` → ``2026-03-23``. "" on failure."""
+    raw = (raw or "").strip()
+    if re.match(r'^\d{6}$', raw):
+        day, mon, yr = raw[0:2], raw[2:4], raw[4:6]
+        try:
+            return datetime.strptime(f"{day}/{mon}/20{yr}", "%d/%m/%Y").strftime("%Y-%m-%d")
+        except ValueError:
+            return ""
+    return ""
+
+
+def _clean_stanchart_desc(raw):
+    """Trim a SC description: drop trailing city, then a known merchant prefix."""
+    raw = (raw or "").strip()
+    # Remove a short city suffix after the last comma (e.g. ", Bangalore").
+    parts = raw.rsplit(",", 1)
+    if len(parts) == 2 and len(parts[1].strip()) < 20:
+        raw = parts[0].strip()
+    # Remove a known aggregator/prefix (PAY*, RAZ*, CAS*, PHP*, IAP , WWW ).
+    for prefix in _SC_PREFIXES:
+        if raw.upper().startswith(prefix.upper()):
+            raw = raw[len(prefix):].strip()
+            break
+    return raw.strip()
+
+
+def parse_stanchart(pdf, card, statement_year):
+    """Standard Chartered Ultimate. Text/line based; INR (last) amount; skips CR.
+
+    Stops at the "Rewards Points Summary" section. Uses the open pdf object and
+    iterates all pages; never opens a new handle.
+    """
+    transactions = []
+    stop_parsing = False
+
+    for page in pdf.pages:
+        if stop_parsing:
+            break
+        try:
+            text = page.extract_text() or ""
+        except Exception as exc:
+            logger.debug("%s: text extraction failed on a page: %s", card, exc)
+            continue
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+        for line in lines:
+            line_lower = line.lower()
+
+            # Everything from the rewards summary onward is not transactions.
+            if "rewards points summary" in line_lower:
+                stop_parsing = True
+                break
+
+            if any(kw in line_lower for kw in _SC_SKIP_KEYWORDS):
+                continue
+
+            # Skip credits / payments / cashbacks (amount ends in CR).
+            if re.search(r'\bCR\s*$', line):
+                continue
+
+            m = _SC_ROW_RE.match(line)
+            if not m:
+                continue
+            date_str, desc_raw, amount_str = m.groups()
+
+            date = _parse_stanchart_date(date_str)
+            if not date:
+                continue
+
+            # Strip the trailing columns that sit between description and INR amount:
+            # transaction reference (long digit run), then rewards earned + type.
+            desc_raw = re.sub(r'\s+\d{20,}\s+', ' ', desc_raw)
+            desc_raw = re.sub(r'\s+\d{1,4}\s+\d{3}\s*$', '', desc_raw)
+            desc_raw = re.sub(r'\s+\d{3}\s*$', '', desc_raw).strip()
+
+            desc = _clean_stanchart_desc(desc_raw)
+            if not desc or re.match(r'^\d+$', desc):
+                continue
+
+            amount, is_credit = parse_amount(amount_str)
+            if is_credit or amount <= 0:
+                continue
+
+            # Belt-and-braces: drop known non-spend rows by description.
+            if any(kw in desc.lower() for kw in ("bill desk", "cidnum", "fuel surcharge reversal")):
+                continue
+
+            transactions.append({
+                "date": date,
+                "description": desc,
+                "raw_description": line,
+                "amount": amount,
+                "card": card,
+            })
+
+    return dedup(transactions)
+
+
+# --------------------------------------------------------------------------- #
+# ICICI Amazon Pay — line-based parser (multi-line descriptions, extra columns).
+# --------------------------------------------------------------------------- #
+# Date + SerNo (11-13 digits) anywhere on the line — some rows carry a stray
+# leading token (e.g. "100% ") before the date, so this is not anchored at ^.
+_ICICI_DATE_RE = re.compile(r'(\d{2}/\d{2}/\d{4})\s+(\d{10,13})\s*(.*)')
+_ICICI_AMOUNT_RE = re.compile(r'([\d,]+\.\d{2})\s*(CR)?\s*$', re.IGNORECASE)
+_ICICI_SKIP = [
+    "payment received", "payment recieved", "bbps payment",
+    "opening balance", "closing balance", "reward", "credit limit",
+    "available credit", "statement", "minimum amount", "total amount",
+    "international spends", "credit summary", "earnings",
+]
+
+
+def _icici_strip_columns(before_amt):
+    """Drop trailing reward-points / international-amount numeric columns.
+
+    Rows read ``<merchant> <reward-pts> <amount>``; this removes the numeric
+    column(s) between the merchant name and the INR amount.
+    """
+    return re.sub(r'(?:\s+\d[\d,]*\.?\d*)+\s*$', '', (before_amt or "")).strip()
+
+
+def parse_icici(pdf, card, statement_year):
+    """ICICI Amazon Pay: line-based parser handling multi-line descriptions.
+
+    ICICI table layout: Date | SerNo(11-13 digits) | Description (wraps to
+    next line with 'IN' suffix noise) | Reward Pts | Intl Amt | Amount
+    Credits end with ' CR' and are skipped. Debits have no suffix.
+    """
+    transactions = []
+    full_lines = []
+    for page in pdf.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception as exc:
+            logger.debug("%s: text extraction failed: %s", card, exc)
+            continue
+        full_lines.extend(text.splitlines())
+
+    i = 0
+    while i < len(full_lines):
+        line = full_lines[i].strip()
+        m = _ICICI_DATE_RE.search(line)
+        if not m:
+            i += 1
+            continue
+
+        date_str, ser_no, rest = m.groups()
+        date = parse_date(date_str, statement_year)
+        if not date:
+            i += 1
+            continue
+
+        desc_parts = [rest.strip()] if rest.strip() else []
+        amount = 0.0
+        is_credit = False
+
+        amt_m = _ICICI_AMOUNT_RE.search(rest)
+        if amt_m:
+            amount, is_credit = parse_amount(amt_m.group(0))
+            desc_parts = [_icici_strip_columns(rest[:amt_m.start()])]
+        else:
+            j = i + 1
+            while j < len(full_lines):
+                nxt = full_lines[j].strip()
+                if not nxt:
+                    j += 1
+                    continue
+                if _ICICI_DATE_RE.search(nxt):
+                    break
+                amt_m = _ICICI_AMOUNT_RE.search(nxt)
+                if amt_m:
+                    amount, is_credit = parse_amount(amt_m.group(0))
+                    before_amt = _icici_strip_columns(nxt[:amt_m.start()])
+                    if before_amt and not re.match(
+                        r'^(IN|#.*|\d[\d,]*\.?\d*)$', before_amt, re.IGNORECASE
+                    ):
+                        desc_parts.append(before_amt)
+                    i = j
+                    break
+                if re.match(
+                    r'^(IN|#\s*International Spends|\d[\d,]*\.?\d*)$',
+                    nxt, re.IGNORECASE
+                ):
+                    j += 1
+                    continue
+                desc_parts.append(nxt)
+                j += 1
+
+        desc = clean_description(" ".join(p for p in desc_parts if p))
+
+        if is_credit or amount <= 0:
+            i += 1
+            continue
+        if any(kw in desc.lower() for kw in _ICICI_SKIP):
+            i += 1
+            continue
+        if date and desc:
+            transactions.append({
+                "date": date,
+                "description": desc,
+                "raw_description": line,
+                "amount": amount,
+                "card": card,
+            })
+        i += 1
+
+    return dedup(transactions)
+
+
 def parse_generic(pdf, card, statement_year):
     return _parse_bank(pdf, card, statement_year, clean_description)
 
@@ -446,10 +744,10 @@ CARD_PARSER = {
     "IDFC Power+": parse_idfc,
     "IDFC Select": parse_idfc,
     "RBL IndianOil": parse_rbl,
-    "Amazon ICICI": parse_generic,
+    "Amazon ICICI": parse_icici,
     "IndusInd": parse_generic,
     "Axis Amex": parse_generic,
-    "Standard Chartered": parse_generic,
+    "Standard Chartered Ultimate": parse_stanchart,
 }
 
 

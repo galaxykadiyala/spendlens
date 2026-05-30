@@ -31,6 +31,11 @@ except ImportError:  # running from inside backend/
 
 logger = logging.getLogger("spendlens.parser")
 
+# Suppress noisy "Could not get FontBBox" warnings from the PDF backends without
+# hiding real errors.
+logging.getLogger("pdfplumber").setLevel(logging.ERROR)
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+
 # --------------------------------------------------------------------------- #
 # Patterns
 # --------------------------------------------------------------------------- #
@@ -57,8 +62,11 @@ DETECTION = {
     "HDFC Diners Black": ["DINERS BLACK CREDIT CARD", "DINERS BLACK"],
     "HDFC Swiggy":       ["SWIGGY HDFC BANK CREDIT CARD"],
     "HSBC Live+":        ["HSBC LIVE+ CREDIT CARD", "HSBC LIVE+"],
-    "IDFC Power+":       ["FIRST POWER+", "FIRST POWER PLUS"],
+    # IDFC Select is checked before Power+ so its specific marker wins; Power+
+    # carries the generic IDFC markers and acts as the default IDFC card.
     "IDFC Select":       ["FIRST SELECT CREDIT CARD", "FIRST SELECT"],
+    "IDFC Power+":       ["FIRST POWER+", "FIRST POWER PLUS", "POWER PLUS CREDIT CARD",
+                          "XX9359", "9359", "IDFCFIRSTBANK", "IDFCFIRST"],
     "RBL IndianOil":     ["INDIANOIL RBL", "RBL BANK", "XTRA CREDIT"],
     "Amazon ICICI":      ["AMAZON PAY ICICI", "AMAZON PAY ICICI BANK"],
     "IndusInd":          ["INDUSIND BANK CREDIT CARD", "INDUSIND BANK"],
@@ -322,8 +330,105 @@ def parse_hsbc(pdf, card, statement_year):
     return _parse_bank(pdf, card, statement_year, clean_description)
 
 
+# Header/summary/credit keywords that must never be treated as IDFC spends.
+_IDFC_SKIP_KEYWORDS = [
+    "billdesk", "payment", "opening balance", "closing balance",
+    "total amount", "minimum amount", "payments & refunds", "purchases",
+    "first power", "reward", "emi", "available", "statement period",
+    "joining fee", "annual fee", "igst assessment", "interest rate",
+    "congratulations", "please note", "card number", "relationship",
+]
+
+# Match: optional date + description + amount + DR/CR (anchored at both ends).
+_IDFC_ROW_RE = re.compile(
+    r'^(\d{1,2}\s+\w{3}\s+\d{2,4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})?\s*'
+    r'(.+?)\s+'
+    r'([\d,]+\.?\d*)\s*(DR|CR)\s*$',
+    re.IGNORECASE,
+)
+
+
+def _parse_idfc_lines(text, card_name, statement_year=None):
+    """Robust line-by-line parser for IDFC statements (Strategy B).
+
+    IDFC rows look like ``20 Dec 25 SBT FILLING STATION Convert 4,259.68 DR``.
+    Skips credits (CR) and payment/summary/header lines; keeps the merchant in
+    between the leading date and the trailing amount, cleaned via
+    :func:`clean_idfc_description`.
+    """
+    transactions = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if any(kw in line.lower() for kw in _IDFC_SKIP_KEYWORDS):
+            continue
+
+        match = _IDFC_ROW_RE.match(line)
+        if not match:
+            continue
+
+        date_str, desc, amount_str, dr_cr = match.groups()
+
+        if dr_cr.upper() == "CR":
+            continue  # skip credits
+
+        amount, is_credit = parse_amount(amount_str + " " + dr_cr)
+        if is_credit or amount <= 0:
+            continue
+
+        date = parse_date(date_str or "", statement_year=statement_year)
+        if not date:
+            continue
+
+        desc = clean_idfc_description(desc.strip())
+        if not desc:
+            continue
+
+        transactions.append({
+            "date": date,
+            "description": desc,
+            "raw_description": line,
+            "amount": amount,
+            "card": card_name,
+        })
+
+    return transactions
+
+
 def parse_idfc(pdf, card, statement_year):
-    return _parse_bank(pdf, card, statement_year, clean_idfc_description)
+    """IDFC (Power+/Select): table extraction first, dedicated line parser as fallback."""
+    # Strategy A — table extraction across all pages.
+    rows = []
+    for page in pdf.pages:
+        try:
+            tables = page.extract_tables() or []
+        except Exception as exc:
+            logger.debug("%s: table extraction failed on a page: %s", card, exc)
+            tables = []
+        for table in tables:
+            for cells in table:
+                try:
+                    r = _row_from_cells(cells, statement_year, clean_idfc_description)
+                except Exception:
+                    r = None
+                if r:
+                    rows.append(r)
+    strategy = "table"
+
+    # Strategy B — dedicated IDFC line parser over all pages' raw text.
+    if not rows:
+        text = ""
+        for page in pdf.pages:
+            try:
+                text += (page.extract_text() or "") + "\n"
+            except Exception as exc:
+                logger.debug("%s: text extraction failed on a page: %s", card, exc)
+        rows = _parse_idfc_lines(text, card, statement_year)
+        strategy = "text"
+
+    logger.debug("%s: strategy '%s' extracted %d transactions", card, strategy, len(rows))
+    return dedup(rows)
 
 
 def parse_rbl(pdf, card, statement_year):
@@ -393,7 +498,7 @@ def detect_and_parse(pdf_path):
         txns.append({
             "date": r["date"],
             "description": desc,
-            "raw_description": desc,
+            "raw_description": r.get("raw_description", desc),
             "amount": r["amount"],
             "card": card,
             "category": cat["category"],

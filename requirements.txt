@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pdfplumber
+python-dotenv
+pandas
+anthropic

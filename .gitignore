@@ -1,0 +1,10 @@
+data/statements/
+data/*.db
+data/*.csv
+__pycache__/
+.env
+node_modules/
+dist/
+*.pyc
+.DS_Store
+venv/

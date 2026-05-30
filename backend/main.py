@@ -446,6 +446,84 @@ def post_bulk_categorize(items: List[BulkCategorizeItem]):
     return {"updated": updated}
 
 
+@app.get("/api/rewards/summary")
+def get_rewards_summary():
+    """All reward-point summaries (one row per card+month)."""
+    return db.get_reward_summary()
+
+
+@app.get("/api/rewards/rates")
+def get_rewards_rates():
+    """Effective reward rate per card: total_points / total_spend * 100."""
+    summaries = db.get_points_by_card()
+    txn_data = db.all_transactions()
+
+    spend_by_card = defaultdict(float)
+    for t in txn_data:
+        spend_by_card[t["card"]] += t["amount"] or 0
+
+    rates = []
+    for s in summaries:
+        card = s["card"]
+        spend = spend_by_card.get(card, 0)
+        rate = (s["total_earned"] / spend * 100) if spend > 0 else 0
+        rates.append({
+            "card": card,
+            "total_spend": _round(spend),
+            "total_points": s["total_earned"],
+            "latest_balance": s["latest_balance"],
+            "rate_per_100": _round(rate, 1),
+        })
+    return sorted(rates, key=lambda x: -x["rate_per_100"])
+
+
+@app.get("/api/rewards/optimize")
+def get_rewards_optimize():
+    """Per-category 'best card' recommendations where breakdown data exists.
+
+    Uses the category-specific earned_fuel / earned_grocery / earned_upi figures
+    (currently only IDFC provides these) against per-card+category spend. Omits a
+    category entirely when data is insufficient rather than guessing.
+    """
+    rows = db.get_reward_summary()
+    txn_data = db.all_transactions()
+
+    spend = defaultdict(float)
+    for t in txn_data:
+        spend[(t["card"], t.get("category", "Miscellaneous"))] += t["amount"] or 0
+
+    pts = defaultdict(float)
+    for r in rows:
+        card = r["card"]
+        if r.get("earned_fuel"):
+            pts[(card, "Fuel")] += r["earned_fuel"]
+        if r.get("earned_grocery"):
+            pts[(card, "Groceries")] += r["earned_grocery"]
+        if r.get("earned_upi"):
+            pts[(card, "UPI")] += r["earned_upi"]
+
+    recommendations = []
+    categories = sorted({cat for _, cat in pts.keys()})
+    all_cards = {c for c, _ in spend.keys()}
+    for cat in categories:
+        card_rates = []
+        for card in all_cards:
+            cat_spend = spend.get((card, cat), 0)
+            cat_pts = pts.get((card, cat), 0)
+            if cat_spend > 0 and cat_pts > 0:
+                card_rates.append({"card": card, "rate": _round(cat_pts / cat_spend * 100, 1)})
+        if card_rates:
+            card_rates.sort(key=lambda x: -x["rate"])
+            best = card_rates[0]
+            recommendations.append({
+                "category": cat,
+                "best_card": best["card"],
+                "rate_per_100": best["rate"],
+                "all_cards": card_rates,
+            })
+    return recommendations
+
+
 @app.post("/api/parse")
 def post_parse():
     """Re-parse every PDF in STATEMENTS_FOLDER and insert new transactions."""

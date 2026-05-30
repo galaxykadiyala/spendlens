@@ -324,8 +324,88 @@ def _parse_bank(pdf, card, statement_year, clean_desc):
 # --------------------------------------------------------------------------- #
 # Per-bank parsers — each iterates all pages (via _parse_bank) and dedups.
 # --------------------------------------------------------------------------- #
+# HDFC Diners Black / Swiggy. Rows look like:
+#   14/04/2026| 07:42 WWW MYNTRA COMGURGAON + 55 C 1,785.00 l
+# The ₹ glyph extracts as 'C'. The REWARDS column ("+ 55" / "- 55") sits just
+# before the amount. A '+' IMMEDIATELY before the amount (e.g. "+ C 14,000.00")
+# marks a CREDIT — payment, refund, earned cashback, or EMI reversal — and is
+# skipped. International rows show "<FCY> <amt> ... C <INR amt>"; requiring the
+# 'C' glyph means we always capture the INR amount.
+_HDFC_DATE_RE = re.compile(r'^(\d{2}/\d{2}/\d{4})\s*\|?\s*(?:\d{1,2}:\d{2})?\s*(.*)$')
+_HDFC_AMOUNT_RE = re.compile(r'([+\-])?\s*[C₹]\s*([\d,]+\.\d{2})(?:\s+l)?\s*$', re.IGNORECASE)
+# Once any of these summary sections begins, no more transactions follow — their
+# dates/amounts (loan rows, reward tables) must not be parsed as spends.
+_HDFC_STOP = [
+    "rewards program points summary", "smart emi loan summary",
+    "merchant emi loan summary", "cash back summary", "gst summary",
+]
+# Defensive description-level skips (the '+' credit rule already catches these).
+_HDFC_SKIP = ["cc payment", "card payment"]
+
+
 def parse_hdfc(pdf, card, statement_year):
-    return _parse_bank(pdf, card, statement_year, clean_description)
+    """HDFC Diners Black / Swiggy: line-based, ₹-glyph ('C') amounts.
+
+    Skips credits (a '+' before the amount), stops before the rewards/EMI loan
+    summaries, and strips the time, rewards column and trailing PI bullet from
+    descriptions.
+    """
+    rows = []
+    stop = False
+    for page in pdf.pages:
+        if stop:
+            break
+        try:
+            text = page.extract_text() or ""
+        except Exception as exc:
+            logger.debug("%s: text extraction failed: %s", card, exc)
+            continue
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if any(k in low for k in _HDFC_STOP):
+                stop = True
+                break
+
+            m = _HDFC_DATE_RE.match(s)
+            if not m:
+                continue
+            date = parse_date(m.group(1), statement_year)
+            if not date:
+                continue
+
+            rest = m.group(2)
+            am = _HDFC_AMOUNT_RE.search(rest)
+            if not am:
+                continue
+            sign, amount_str = am.group(1), am.group(2)
+            if sign == "+":
+                continue  # credit: payment / refund / cashback / EMI reversal
+            amount = float(amount_str.replace(",", ""))
+            if amount <= 0:
+                continue
+
+            before = rest[:am.start()].strip()
+            before = re.sub(r'\s*[+\-]\s*\d+\s*$', '', before)          # rewards column
+            before = re.sub(r'\s+[A-Z]{3}\s+[\d,]+\.\d{2}\s*$', '', before)  # FCY amount
+            before = re.sub(r'\s+\d{6,}\s*$', '', before)               # trailing ref
+            before = re.sub(r'^EMI\s+', '', before, flags=re.IGNORECASE)  # EMI badge
+            desc = clean_description(before)
+            if not desc:
+                continue
+            if any(k in desc.lower() for k in _HDFC_SKIP):
+                continue
+
+            rows.append({
+                "date": date,
+                "description": desc,
+                "raw_description": s,
+                "amount": amount,
+                "card": card,
+            })
+    return dedup(rows)
 
 
 def parse_hsbc(pdf, card, statement_year):
@@ -501,8 +581,172 @@ def parse_idfc(pdf, card, statement_year):
     return dedup(rows)
 
 
+# RBL IndianOil XTRA. Transactions are listed under "THE MONTH GONE BY!" with
+# columns: Date | Description | Amount. Dates are "DD Mon YYYY"; amounts have no
+# DR/CR marker, so credits are identified by description keyword. We scope strictly
+# to that section so the page-2 fees/illustration tables (2018-2019 sample rows)
+# are never parsed as real transactions.
+_RBL_DATE_RE = re.compile(r'^(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\b')
+_RBL_AMOUNT_RE = re.compile(r'([\d,]+\.\d{2})\s*$')
+_RBL_START = "the month gone by"
+_RBL_STOP = ("eligible for emi", "your spending pattern", "look out for exclusive",
+             "reward summary")
+_RBL_SKIP = ["payment received", "payment", "reversal", "refund",
+             "goods & service tax", "goods and service tax"]
+
+
 def parse_rbl(pdf, card, statement_year):
-    return _parse_bank(pdf, card, statement_year, clean_description)
+    """RBL IndianOil XTRA: parse only the 'THE MONTH GONE BY!' table.
+
+    Plain amounts (no DR/CR); credits are recognised by keyword. Zero-amount
+    and payment/credit rows are skipped.
+    """
+    rows = []
+    in_txn = False
+    for page in pdf.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception as exc:
+            logger.debug("%s: text extraction failed: %s", card, exc)
+            continue
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if _RBL_START in low:
+                in_txn = True
+                continue
+            if not in_txn:
+                continue
+            if any(k in low for k in _RBL_STOP):
+                in_txn = False
+                continue
+            if low.startswith("date") and "description" in low:
+                continue  # column header
+            m = _RBL_DATE_RE.match(s)
+            if not m:
+                continue
+            date = parse_date(m.group(1), statement_year)
+            if not date:
+                continue
+            rest = s[m.end():].strip()
+            am = _RBL_AMOUNT_RE.search(rest)
+            if not am:
+                continue
+            amount = float(am.group(1).replace(",", ""))
+            if amount <= 0:
+                continue
+            desc = clean_description(rest[:am.start()])
+            if not desc or any(k in desc.lower() for k in _RBL_SKIP):
+                continue
+            rows.append({
+                "date": date,
+                "description": desc,
+                "raw_description": s,
+                "amount": amount,
+                "card": card,
+            })
+    return dedup(rows)
+
+
+# --------------------------------------------------------------------------- #
+# IndusInd CRED RuPay. Table: Date | Details | Merchant Category | CRED Points |
+# Amount, with explicit DR/CR. Long UPI rows wrap the merchant-category across
+# 2-3 physical lines (amount on its own line). We scope to the "Purchases & Cash
+# Transactions" / "Payment Details" sections so the page-1 summary block can't
+# fabricate transactions, and reassemble wrapped rows via a line buffer.
+# --------------------------------------------------------------------------- #
+_INDUS_DATE_RE = re.compile(r'^(\d{2}/\d{2}/\d{4})')
+_INDUS_TERM_RE = re.compile(r'(\d{1,6})\s+([\d,]+\.\d{2})\s+(DR|CR)\s*$', re.IGNORECASE)
+_INDUS_CATEGORIES = sorted([
+    "GROCERY & SUPERMARKET", "CONSUMER DURABLES", "CONSUMER ELECTRONICS",
+    "FINANCIAL SERVICES", "APPAREL & ACCESSORIES", "HEALTH & WELLNESS",
+    "DEPARTMENT STORES", "DEPARTMENTAL STORES", "MISCELLANEOUS", "RESTAURANTS",
+    "AUTOMOTIVE", "ELECTRONICS", "ENTERTAINMENT", "SUPERMARKET", "JEWELLERY",
+    "UTILITIES", "EDUCATION", "INSURANCE", "AIRLINES", "RAILWAYS", "TELECOM",
+    "MEDICAL", "APPARELS", "APPAREL", "HOTELS", "TRAVEL", "FUEL", "FOOD",
+], key=len, reverse=True)
+_INDUS_CAT_RE = re.compile(
+    r'\s+(?:' + '|'.join(re.escape(c) for c in _INDUS_CATEGORIES) + r')\s*$',
+    re.IGNORECASE,
+)
+
+
+def _indusind_desc(prefix):
+    """Extract a merchant from the IndusInd 'details + category' segment.
+
+    UPI rows are "UPI <merchant> <ref-digits> <category>" — take the merchant
+    between 'UPI' and the reference number. Otherwise strip a trailing known
+    merchant-category label.
+    """
+    prefix = clean_description(prefix)
+    m = re.match(r'(?i)^UPI\s+(.+?)\s+\d{8,}\b', prefix)
+    if m:
+        return clean_description(m.group(1))
+    prev = None
+    while prev != prefix:
+        prev = prefix
+        prefix = _INDUS_CAT_RE.sub('', prefix).strip()
+    return prefix
+
+
+def parse_indusind(pdf, card, statement_year):
+    """IndusInd CRED RuPay: section-scoped, multi-line-aware. Skips CR rows."""
+    rows = []
+    in_txn = False
+    buffer = []
+    for page in pdf.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception as exc:
+            logger.debug("%s: text extraction failed: %s", card, exc)
+            continue
+        for line in text.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            low = s.lower()
+            if "purchases & cash transactions for" in low or "payment details for" in low:
+                in_txn = True
+                buffer = []
+                continue
+            if not in_txn:
+                continue
+            if low.startswith("total ") or "how to make payments" in low:
+                in_txn = False
+                buffer = []
+                continue
+
+            if _INDUS_DATE_RE.match(s):
+                buffer = [s]
+            elif buffer:
+                buffer.append(s)
+            else:
+                continue
+
+            combined = " ".join(buffer)
+            term = _INDUS_TERM_RE.search(combined)
+            if not term:
+                continue
+            # Completed transaction.
+            dm = _INDUS_DATE_RE.match(combined)
+            date = parse_date(dm.group(1), statement_year) if dm else ""
+            drcr = term.group(3).upper()
+            amount = float(term.group(2).replace(",", ""))
+            prefix = combined[dm.end():term.start()] if dm else combined[:term.start()]
+            desc = _indusind_desc(prefix)
+            buffer = []
+            if drcr == "CR" or amount <= 0 or not date or not desc:
+                continue
+            rows.append({
+                "date": date,
+                "description": desc,
+                "raw_description": combined,
+                "amount": amount,
+                "card": card,
+            })
+    return dedup(rows)
 
 
 # Header/footer/payment lines that are never spends in a SC statement.
@@ -745,10 +989,223 @@ CARD_PARSER = {
     "IDFC Select": parse_idfc,
     "RBL IndianOil": parse_rbl,
     "Amazon ICICI": parse_icici,
-    "IndusInd": parse_generic,
+    "IndusInd": parse_indusind,
     "Axis Amex": parse_generic,
     "Standard Chartered Ultimate": parse_stanchart,
 }
+
+
+# --------------------------------------------------------------------------- #
+# Reward points extraction
+# --------------------------------------------------------------------------- #
+_RW_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+}
+
+
+def _rw_int(s):
+    """Parse a reward count like '20,354' or '75362.00' to int. 0 on failure."""
+    if s is None:
+        return 0
+    s = str(s).replace(",", "").strip()
+    if not s:
+        return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def _rw_find(pattern, text, group=1):
+    m = re.search(pattern, text, re.IGNORECASE)
+    return _rw_int(m.group(group)) if m else 0
+
+
+def _statement_month_from_text(text):
+    """Extract 'YYYY-MM' from a statement-date line. '' if not found.
+
+    Handles 'May 18, 2026', '23 Apr 2026', and 'Statement Date: 18/05/2026'.
+    """
+    if not text:
+        return ""
+
+    def _mk(year, month):
+        try:
+            mo = int(month)
+        except (TypeError, ValueError):
+            mo = _RW_MONTHS.get(str(month)[:3].lower(), 0)
+        if 1 <= mo <= 12:
+            return f"{int(year):04d}-{mo:02d}"
+        return ""
+
+    # Anchored on "Statement Date" (handles SC and numeric forms).
+    anchored = [
+        r'statement date[^A-Za-z0-9]{0,4}([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(20\d{2})',  # Mon DD, YYYY
+        r'statement date[^A-Za-z0-9]{0,4}(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(20\d{2})',     # DD Mon YYYY
+        r'statement date[^0-9]{0,4}(\d{1,2})[/-](\d{1,2})[/-](20\d{2})',                  # DD/MM/YYYY
+    ]
+    for i, pat in enumerate(anchored):
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            if i == 0:
+                return _mk(m.group(3), m.group(1))
+            if i == 1:
+                return _mk(m.group(3), m.group(2))
+            return _mk(m.group(3), m.group(2))
+
+    # Unanchored fallbacks (first occurrence — usually the statement date).
+    m = re.search(r'\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s*(20\d{2})\b', text)
+    if m and m.group(1)[:3].lower() in _RW_MONTHS:
+        return _mk(m.group(3), m.group(1))
+    m = re.search(r'\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(20\d{2})\b', text)
+    if m and m.group(2)[:3].lower() in _RW_MONTHS:
+        return _mk(m.group(3), m.group(2))
+    return ""
+
+
+def _rewards_icici(text):
+    """ICICI Amazon Pay: EARNINGS block with a '<earned> <transferred>' data row."""
+    m = re.search(r'EARNINGS', text)
+    if not m:
+        return None
+    dm = re.search(r'(\d{1,7})\s+(\d{1,7})', text[m.end():m.end() + 250])
+    if not dm:
+        return None
+    earned = _rw_int(dm.group(1))
+    return {"opening_balance": 0, "earned": earned, "redeemed": 0,
+            "closing_balance": earned, "earned_fuel": 0, "earned_grocery": 0,
+            "earned_upi": 0, "earned_other": earned}
+
+
+def _rewards_idfc(text):
+    """IDFC FIRST: rewards summary with category breakdown."""
+    earned = _rw_find(r'Earned this Month\s*\+?\s*([\d,]+)', text)
+    closing = _rw_find(r'Total Reward Points Available[^\d=]*=?\s*([\d,]+)', text)
+    # Points opening balance is an integer (the rupee one is 'Opening Balance r419.58').
+    om = re.search(r'Opening Balance\s+([\d,]+)(?!\s*\.\d)', text)
+    opening = _rw_int(om.group(1)) if om else 0
+    redeemed = _rw_find(r'Adjusted/Redeemed\s*-?\s*([\d,]+)', text)
+    fuel = _rw_find(r'HPCL[^\n]*?FASTag[^\n]*?([\d,]+)', text)
+    grocery = _rw_find(r'Grocery\s*&\s*Utility spends[^\d]*([\d,]+)', text)
+    upi = _rw_find(r'UPI spends[^\d]*([\d,]+)', text)
+    other = _rw_find(r'Other retail spends[^\d]*([\d,]+)', text)
+    if not (earned or closing or opening):
+        return None
+    if not closing and (opening or earned):
+        closing = max(opening + earned - redeemed, 0)
+    return {"opening_balance": opening, "earned": earned, "redeemed": redeemed,
+            "closing_balance": closing, "earned_fuel": fuel, "earned_grocery": grocery,
+            "earned_upi": upi, "earned_other": other}
+
+
+def _rewards_hdfc(text):
+    """HDFC Diners Black: 'Reward Points <closing>' + a 4-number summary row
+    (opening, earned, disbursed, adjusted/lapsed). Swiggy (cashback) → None."""
+    # Closing balance sits just before the 'Points Earned' label (e.g. '56,534 Points Earned').
+    closing = _rw_find(r'([\d,]+)\s+Points Earned', text)
+    # The 4-number summary row (opening earned disbursed adjusted) follows the
+    # 'Reward Points ...' header block.
+    m = re.search(
+        r'Reward Points[\s\S]{0,240}?[\r\n]\s*([\d,]+)\s+([\d,]+)\s+([\d,]+)\s+([\d,]+)\b',
+        text,
+    )
+    if not m and not closing:
+        return None
+    opening = earned = redeemed = 0
+    if m:
+        opening = _rw_int(m.group(1))
+        earned = _rw_int(m.group(2))
+        redeemed = _rw_int(m.group(3))
+    if not closing and (opening or earned):
+        closing = max(opening + earned - redeemed, 0)
+    if not (earned or closing):
+        return None
+    return {"opening_balance": opening, "earned": earned, "redeemed": redeemed,
+            "closing_balance": closing, "earned_fuel": 0, "earned_grocery": 0,
+            "earned_upi": 0, "earned_other": earned}
+
+
+def _rewards_hsbc(text):
+    """HSBC LIVE+ is a cashback card (no reward-point summary) → None."""
+    m = re.search(r'reward points?\b[^\n]*?opening[^\d]*([\d,]+)[^\d]+([\d,]+)[^\d]+([\d,]+)',
+                  text, re.IGNORECASE)
+    if not m:
+        return None
+    opening, earned, closing = (_rw_int(m.group(i)) for i in (1, 2, 3))
+    return {"opening_balance": opening, "earned": earned, "redeemed": 0,
+            "closing_balance": closing, "earned_fuel": 0, "earned_grocery": 0,
+            "earned_upi": 0, "earned_other": earned}
+
+
+def _rewards_sc(text):
+    """Standard Chartered: REWARDS POINTS SUMMARY card row(s)."""
+    best = None
+    for m in re.finditer(
+        r'(?i)Mastercard\s+points\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)', text
+    ):
+        opening = _rw_int(m.group(1))
+        earned = _rw_int(m.group(2))
+        adjusted = _rw_int(m.group(3))
+        closing = _rw_int(m.group(4))
+        if best is None or earned > best["earned"]:
+            best = {"opening_balance": opening, "earned": earned, "redeemed": adjusted,
+                    "closing_balance": closing, "earned_fuel": 0, "earned_grocery": 0,
+                    "earned_upi": 0, "earned_other": earned}
+    return best
+
+
+def _rewards_generic(text):
+    """Best-effort sweep for banks without a bespoke reward parser."""
+    m = re.search(
+        r'(?:reward|points)\s+(?:balance|earned|summary)[^\n]*\n[^\n]*?(\d[\d,]+)',
+        text, re.IGNORECASE,
+    )
+    if not m:
+        return None
+    earned = _rw_int(m.group(1))
+    if not earned:
+        return None
+    return {"opening_balance": 0, "earned": earned, "redeemed": 0,
+            "closing_balance": earned, "earned_fuel": 0, "earned_grocery": 0,
+            "earned_upi": 0, "earned_other": earned}
+
+
+_REWARD_EXTRACTORS = {
+    "Amazon ICICI": _rewards_icici,
+    "IDFC Power+": _rewards_idfc,
+    "IDFC Select": _rewards_idfc,
+    "HSBC Live+": _rewards_hsbc,
+    "Standard Chartered Ultimate": _rewards_sc,
+    "HDFC Diners Black": _rewards_hdfc,
+    "HDFC Swiggy": _rewards_hdfc,
+}
+
+
+def _extract_rewards(card, text):
+    """Dispatch to a bank reward extractor. Never raises — returns dict or None."""
+    try:
+        fn = _REWARD_EXTRACTORS.get(card, _rewards_generic)
+        rewards = fn(text)
+        if rewards is None:
+            return None
+        # Ensure all keys present.
+        for k in ("opening_balance", "earned", "redeemed", "closing_balance",
+                  "earned_fuel", "earned_grocery", "earned_upi", "earned_other"):
+            rewards[k] = int(rewards.get(k, 0) or 0)
+        return rewards
+    except Exception as exc:
+        logger.debug("reward extraction failed for %s: %s", card, exc)
+        return None
+
+
+def _month_from_transactions(txns):
+    """Most recent YYYY-MM among transaction dates (statement-period anchor)."""
+    months = [t["date"][:7] for t in txns if t.get("date") and len(t["date"]) >= 7]
+    return max(months) if months else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -768,22 +1225,28 @@ def detect_bank(pdf_path):
 
 
 def detect_and_parse(pdf_path):
-    """Detect the bank and return a list of enriched transaction dicts.
+    """Detect the bank, parse it, and extract reward points.
 
-    Each dict: date, description, raw_description, amount, card, category,
-    confidence, suggested_category, source_file. Returns ``[]`` if the bank is
-    unrecognized or nothing parsed. Uses context managers throughout.
+    Returns ``{"transactions": [...], "rewards": dict|None}``. Each transaction
+    dict has: date, description, raw_description, amount, card, category,
+    confidence, suggested_category, source_file. Returns empty transactions (and
+    rewards None) if the bank is unrecognized. Uses context managers throughout.
     """
     card = detect_bank(pdf_path)
     if not card:
         logger.error("Bank format not recognized: %s", os.path.basename(pdf_path))
-        return []
+        return {"transactions": [], "rewards": None}
 
     with pdfplumber.open(pdf_path) as pdf:
-        text = ""
-        for page in pdf.pages[:3]:
-            text += (page.extract_text() or "")
-        statement_year = _statement_year_from_text(text)
+        head = ""
+        full = []
+        for idx, page in enumerate(pdf.pages):
+            txt = page.extract_text() or ""
+            full.append(txt)
+            if idx < 3:
+                head += txt
+        full_text = "\n".join(full)
+        statement_year = _statement_year_from_text(head)
         parser_fn = CARD_PARSER.get(card, parse_generic)
         raw_rows = parser_fn(pdf, card, statement_year)
     # pdf is closed here.
@@ -804,20 +1267,29 @@ def detect_and_parse(pdf_path):
             "suggested_category": "",
             "source_file": source_file,
         })
-    return txns
+
+    # Reward points (never fails the parse).
+    rewards = _extract_rewards(card, full_text)
+    if rewards is not None:
+        month = _statement_month_from_text(full_text) or _month_from_transactions(txns)
+        rewards["statement_month"] = month
+
+    return {"transactions": txns, "rewards": rewards}
 
 
 def parse_file(pdf_path):
-    """Parse one PDF into the {"ok", "card", "transactions", "error"} envelope.
+    """Parse one PDF into the {"ok", "card", "transactions", "rewards", "error"} envelope.
 
     Never raises — a bad file is reported via the dict so a batch keeps going.
     Used by the FastAPI ``/api/parse`` route.
     """
     source_file = os.path.basename(pdf_path)
-    result = {"ok": False, "card": None, "transactions": [], "error": None}
+    result = {"ok": False, "card": None, "transactions": [], "rewards": None, "error": None}
     try:
-        txns = detect_and_parse(pdf_path)
+        parsed = detect_and_parse(pdf_path)
+        txns = parsed["transactions"]
         result["transactions"] = txns
+        result["rewards"] = parsed.get("rewards")
         result["card"] = txns[0]["card"] if txns else (detect_bank(pdf_path) or None)
         result["ok"] = True
     except Exception as exc:  # never crash the batch on one file
@@ -834,9 +1306,13 @@ def test_parser(pdf_path):
 
     Usage: python -c "from backend.parser import test_parser; test_parser('file.pdf')"
     """
-    transactions = detect_and_parse(pdf_path)
+    parsed = detect_and_parse(pdf_path)
+    transactions = parsed["transactions"]
+    rewards = parsed.get("rewards")
     if not transactions:
         print(f"❌ No transactions extracted from {pdf_path}")
+        if rewards:
+            print(f"   (rewards found: {rewards})")
         return
     print(f"✅ {len(transactions)} transactions extracted")
     print(f"   Card:       {transactions[0].get('card', 'unknown')}")
@@ -853,3 +1329,10 @@ def test_parser(pdf_path):
     print("\nCategories:")
     for cat, total in sorted(cats.items(), key=lambda x: -x[1]):
         print(f"  {cat:<25} ₹{total:>10,.2f}")
+    if rewards:
+        print("\nRewards:")
+        print(f"  month={rewards.get('statement_month')} opening={rewards['opening_balance']} "
+              f"earned={rewards['earned']} redeemed={rewards['redeemed']} "
+              f"closing={rewards['closing_balance']} "
+              f"(fuel={rewards['earned_fuel']} grocery={rewards['earned_grocery']} "
+              f"upi={rewards['earned_upi']} other={rewards['earned_other']})")

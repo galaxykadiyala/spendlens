@@ -32,6 +32,31 @@ CREATE TABLE IF NOT EXISTS transactions (
 );
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS category_overrides (pattern TEXT PRIMARY KEY, category TEXT);
+CREATE TABLE IF NOT EXISTS reward_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card TEXT NOT NULL,
+    statement_month TEXT NOT NULL,
+    opening_balance INTEGER DEFAULT 0,
+    earned INTEGER DEFAULT 0,
+    redeemed INTEGER DEFAULT 0,
+    closing_balance INTEGER DEFAULT 0,
+    earned_fuel INTEGER DEFAULT 0,
+    earned_grocery INTEGER DEFAULT 0,
+    earned_upi INTEGER DEFAULT 0,
+    earned_other INTEGER DEFAULT 0,
+    source_file TEXT,
+    parsed_at TEXT,
+    UNIQUE(card, statement_month)
+);
+CREATE TABLE IF NOT EXISTS transaction_points (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id INTEGER REFERENCES transactions(id),
+    points_earned INTEGER DEFAULT 0,
+    card TEXT,
+    date TEXT,
+    description TEXT,
+    amount REAL
+);
 CREATE INDEX IF NOT EXISTS idx_date ON transactions(date);
 CREATE INDEX IF NOT EXISTS idx_card ON transactions(card);
 CREATE INDEX IF NOT EXISTS idx_category ON transactions(category);
@@ -390,3 +415,107 @@ def all_transactions():
     """Return every transaction ordered by date (used for CSV export/aggregates)."""
     rows, _ = query_transactions(order_by="date", order_dir="ASC")
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# Reward points
+# --------------------------------------------------------------------------- #
+def insert_reward_summary(card, month, data, source_file=None):
+    """Upsert one card+month reward summary. `data` is the rewards dict."""
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO reward_points "
+            "(card, statement_month, opening_balance, earned, redeemed, closing_balance, "
+            " earned_fuel, earned_grocery, earned_upi, earned_other, source_file, parsed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                card,
+                month,
+                int(data.get("opening_balance", 0) or 0),
+                int(data.get("earned", 0) or 0),
+                int(data.get("redeemed", 0) or 0),
+                int(data.get("closing_balance", 0) or 0),
+                int(data.get("earned_fuel", 0) or 0),
+                int(data.get("earned_grocery", 0) or 0),
+                int(data.get("earned_upi", 0) or 0),
+                int(data.get("earned_other", 0) or 0),
+                source_file,
+                datetime.now().isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+        return 1
+    finally:
+        conn.close()
+
+
+def insert_transaction_points(rows):
+    """Bulk-insert per-transaction reward points. Each row: {points_earned, card,
+    date, description, amount, transaction_id?}. Returns count inserted."""
+    if not rows:
+        return 0
+    conn = connect()
+    try:
+        conn.executemany(
+            "INSERT INTO transaction_points "
+            "(transaction_id, points_earned, card, date, description, amount) "
+            "VALUES (:transaction_id, :points_earned, :card, :date, :description, :amount)",
+            [
+                {
+                    "transaction_id": r.get("transaction_id"),
+                    "points_earned": int(r.get("points_earned", 0) or 0),
+                    "card": r.get("card"),
+                    "date": r.get("date"),
+                    "description": r.get("description"),
+                    "amount": float(r.get("amount", 0) or 0),
+                }
+                for r in rows
+            ],
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def get_reward_summary():
+    """All reward_points rows ordered by card, then statement_month."""
+    conn = connect()
+    try:
+        cur = conn.execute(
+            "SELECT * FROM reward_points ORDER BY card, statement_month"
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_points_by_card():
+    """Per-card rollup: [{card, latest_balance, total_earned, months_tracked}]."""
+    conn = connect()
+    try:
+        cur = conn.execute(
+            "SELECT card, "
+            "       SUM(earned) AS total_earned, "
+            "       COUNT(*) AS months_tracked "
+            "FROM reward_points GROUP BY card"
+        )
+        out = []
+        for r in cur.fetchall():
+            card = r["card"]
+            # latest_balance = closing_balance of the most recent statement_month.
+            lb = conn.execute(
+                "SELECT closing_balance FROM reward_points "
+                "WHERE card = ? ORDER BY statement_month DESC LIMIT 1",
+                (card,),
+            ).fetchone()
+            out.append({
+                "card": card,
+                "latest_balance": int(lb["closing_balance"]) if lb else 0,
+                "total_earned": int(r["total_earned"] or 0),
+                "months_tracked": int(r["months_tracked"] or 0),
+            })
+        return out
+    finally:
+        conn.close()

@@ -103,10 +103,13 @@ def parse_all(files, workers=None):
                 filename = Path(filepath).name
                 print(f"[{i}/{len(files)}] {filename}", end=" ... ", flush=True)
                 try:
-                    txns = future.result()
-                    results[filepath] = txns
+                    res = future.result()
+                    results[filepath] = res
+                    txns = res.get("transactions", []) if res else []
+                    rewards = res.get("rewards") if res else None
                     if txns:
-                        print(f"✓ {len(txns)} txns [{txns[0].get('card', 'unknown')}]")
+                        tag = " +rewards" if rewards else ""
+                        print(f"✓ {len(txns)} txns [{txns[0].get('card', 'unknown')}]{tag}")
                     else:
                         print("⚠ 0 txns")
                 except Exception as e:
@@ -153,12 +156,17 @@ def _count_category(category):
 # --------------------------------------------------------------------------- #
 # Summary
 # --------------------------------------------------------------------------- #
-def print_summary(results, skipped_db, skipped_files, total_new):
+def _result_txns(res):
+    """Transactions list from a parse_all result entry (dict | None)."""
+    return res.get("transactions", []) if res else []
+
+
+def print_summary(results, skipped_db, skipped_files, total_new, rewards_stored=0):
     print("\n" + "=" * 55)
 
-    ok = [(f, t) for f, t in results if t]
-    empty = [(f, t) for f, t in results if t == []]
-    failed = [(f, t) for f, t in results if t is None]
+    failed = [(f, r) for f, r in results if r is None]
+    ok = [(f, r) for f, r in results if r is not None and _result_txns(r)]
+    empty = [(f, r) for f, r in results if r is not None and not _result_txns(r)]
 
     print(
         f"\n{total_new} new transactions | "
@@ -167,13 +175,15 @@ def print_summary(results, skipped_db, skipped_files, total_new):
         f"{len(empty)} empty | "
         f"{len(failed)} failed"
     )
+    if rewards_stored:
+        print(f"{rewards_stored} reward summaries stored")
 
     # Per-card breakdown.
     if ok:
         print("\nBy card:")
         card_totals = {}
-        for _, txns in ok:
-            for t in txns:
+        for _, res in ok:
+            for t in _result_txns(res):
                 card = t.get("card", "Unknown")
                 card_totals.setdefault(card, {"count": 0, "amount": 0.0})
                 card_totals[card]["count"] += 1
@@ -182,7 +192,7 @@ def print_summary(results, skipped_db, skipped_files, total_new):
             print(f"  {card:<28} {data['count']:>4} txns   ₹{data['amount']:>12,.0f}")
 
     # Date range across everything parsed this run.
-    all_dates = [t["date"] for _, txns in ok for t in txns if t.get("date")]
+    all_dates = [t["date"] for _, res in ok for t in _result_txns(res) if t.get("date")]
     if all_dates:
         print(f"\nDate range: {min(all_dates)} → {max(all_dates)}")
 
@@ -302,20 +312,34 @@ def main():
     # Parse (parallel, interruptible).
     results = parse_all(to_parse, args.workers)
 
-    # Insert each file's rows atomically (skip empty / failed).
+    # Insert each file's rows atomically (skip empty / failed) and store rewards.
     total_new = 0
-    for f, txns in results:
+    rewards_stored = 0
+    for f, res in results:
         if interrupted:
             break
-        if not txns:  # None (failed) or [] (empty)
+        if not res:  # None (failed)
             continue
-        total_new += insert_file_atomic(txns)
+        txns = res.get("transactions", [])
+        rewards = res.get("rewards")
+        if txns:
+            total_new += insert_file_atomic(txns)
+        if rewards and rewards.get("statement_month"):
+            card = txns[0]["card"] if txns else ""
+            if card:
+                try:
+                    db.insert_reward_summary(card, rewards["statement_month"],
+                                             rewards, Path(f).name)
+                    rewards_stored += 1
+                except Exception as exc:
+                    logging.getLogger("spendlens.parse").error(
+                        "Reward insert failed for %s: %s", Path(f).name, exc)
 
     # Optional AI suggestions for unknown merchants.
     if not interrupted:
         run_ai_suggestions()
 
-    print_summary(results, skipped_db, skipped_files, total_new)
+    print_summary(results, skipped_db, skipped_files, total_new, rewards_stored)
 
     # Clean exit (0) even on interrupt — progress was saved.
     sys.exit(0)

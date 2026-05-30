@@ -8,6 +8,7 @@ import Merchants from './pages/Merchants'
 import Transactions from './pages/Transactions'
 import Insights from './pages/Insights'
 import Review from './pages/Review'
+import Rewards from './pages/Rewards'
 
 export default function App() {
   return (
@@ -20,6 +21,7 @@ export default function App() {
           <Route path="/monthly" element={<Monthly />} />
           <Route path="/cards" element={<Cards />} />
           <Route path="/merchants" element={<Merchants />} />
+          <Route path="/rewards" element={<Rewards />} />
           <Route path="/transactions" element={<Transactions />} />
           <Route path="/insights" element={<Insights />} />
           <Route path="/review" element={<Review />} />

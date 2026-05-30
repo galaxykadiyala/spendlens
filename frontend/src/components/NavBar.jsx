@@ -8,6 +8,7 @@ const LINKS = [
   { to: '/monthly', label: 'Monthly' },
   { to: '/cards', label: 'Cards' },
   { to: '/merchants', label: 'Merchants' },
+  { to: '/rewards', label: 'Rewards' },
   { to: '/transactions', label: 'Transactions' },
   { to: '/insights', label: 'Insights' },
   { to: '/review', label: 'Review Queue' },

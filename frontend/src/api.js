@@ -14,6 +14,11 @@ export const api = {
   recategorize: (body) => client.post('/api/recategorize', body).then((r) => r.data),
   reviewQueue: () => client.get('/api/review-queue').then((r) => r.data),
   bulkCategorize: (items) => client.post('/api/bulk-categorize', items).then((r) => r.data),
+  rewards: {
+    summary: () => client.get('/api/rewards/summary').then((r) => r.data),
+    rates: () => client.get('/api/rewards/rates').then((r) => r.data),
+    optimize: () => client.get('/api/rewards/optimize').then((r) => r.data),
+  },
   parse: () => client.post('/api/parse').then((r) => r.data),
   exportCsvUrl: () => '/api/export/csv',
 }

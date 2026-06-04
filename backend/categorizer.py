@@ -25,7 +25,7 @@ CATEGORY_RULES = {
     'Bills & Utilities': ['airtel', 'vodafone', 'vil pay', 'electricity', 'broadband', 'tata sky', 'cred', 'credpay', 'airtel in si', 'www airtel', 'spaybbps 9004201229 banga', 'bharat billpayment 512602431859', 'bharat billpayment 509706133632', 'bharat billpayment 503604408941', 'gateway security'],
     'Subscriptions': ['netflix', 'hotstar', 'spotify', 'amazon prime', 'mflxnl', 'dream11', 'dreampl', 'alleven', 'uni seo', 'directo', 'claude.ai', 'anthropic', 'openai *chatgpt subscr', 'openai', 'rechargevali', 'bundl technologiesbengaluru', 'rsp*eenadu television', 'googlecloud', 'ind*linkedin', 'upwork', 'emudhra'],
     'Personal Care': ['loreal', 'hair', 'salon', 'grooming', 'foxtale', 'tru derma pvt ltd', 'youstabengaluru', 'twistylocks', 'seoulskin', 'mytrident', 'minimalist', 'fsn ecommerce'],
-    'Household Help': ['davulur', 'nishamb', 'mrs pri', 'manasa', 'mr sadu', 'prajwal', 'urbanclap', 'uma n', 'kesani naresh', 'perumal'],
+    'Household Help': ['urbanclap'],
     'Entertainment': ['movie', 'pvr', 'inox', 'district', 'game', 'grips go karting and b', 'viacom18 media private', 'paul john'],
     'Kids': ['firstcry', 'ignited brain', 'ms kids', 'cuddly'],
     'Insurance': ['acko', 'lic', 'insurance', 'star health', 'starhealth', 'pramerica'],

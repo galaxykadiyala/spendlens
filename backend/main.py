@@ -125,11 +125,13 @@ def get_transactions(
     excluded: int = Query(None),
 ):
     offset = (page - 1) * per_page
+    # When the client doesn't specify `excluded`, this list route shows all rows
+    # (the page renders excluded ones greyed out); an explicit excluded=0/1 filters.
     rows, total = db.query_transactions(
         card=card, category=category, month=month, q=q,
         min_amount=min_amount, max_amount=max_amount,
         limit=per_page, offset=offset, order_by=sort, order_dir=dir,
-        excluded=excluded,
+        excluded=excluded, include_excluded=(excluded is None),
     )
     return {
         "transactions": rows,
@@ -574,7 +576,7 @@ def post_parse():
 
 @app.get("/api/export/csv")
 def export_csv():
-    txns = db.all_transactions(include_excluded=True)  # raw dump includes excluded
+    txns = db.all_transactions()  # excluded rows are omitted from the export
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(["id", "date", "description", "raw_description", "amount",

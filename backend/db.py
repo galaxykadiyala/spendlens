@@ -364,17 +364,23 @@ def low_confidence_transactions(threshold=0.0):
 
 def query_transactions(card=None, category=None, month=None, q=None,
                        min_amount=None, max_amount=None, limit=None, offset=0,
-                       order_by="date", order_dir="DESC", excluded=None):
+                       order_by="date", order_dir="DESC", excluded=None,
+                       include_excluded=False):
     """Flexible transaction query. Returns (rows, total_count).
 
     `month` is matched as a YYYY-MM prefix on the ISO date string.
-    `excluded`: None → no filter (show all); 0 → only active; 1 → only excluded.
+    `excluded`: explicit filter — None → use default; 0 → only active; 1 → only excluded.
+    By default (excluded=None, include_excluded=False) excluded rows are HIDDEN;
+    pass include_excluded=True to show everything.
     """
     where = []
     params = []
-    if excluded is not None:
+    eff_excluded = excluded
+    if eff_excluded is None and not include_excluded:
+        eff_excluded = 0  # default: hide excluded rows
+    if eff_excluded is not None:
         where.append("excluded = ?")
-        params.append(int(excluded))
+        params.append(int(eff_excluded))
     if card:
         where.append("card = ?")
         params.append(card)
@@ -429,7 +435,7 @@ def all_transactions(include_excluded=False):
     them; pass ``include_excluded=True`` for a complete raw dump.
     """
     rows, _ = query_transactions(order_by="date", order_dir="ASC",
-                                 excluded=None if include_excluded else 0)
+                                 include_excluded=include_excluded)
     return rows
 
 

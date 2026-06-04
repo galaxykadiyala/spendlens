@@ -12,6 +12,10 @@ export default function Review() {
   // Ids fully removed from view (confirmed).
   const [confirmed, setConfirmed] = useState({})
   const [saving, setSaving] = useState(false)
+  // Rows the user has explicitly touched (changed or confirmed) — only these save.
+  const [touched, setTouched] = useState(new Set())
+  // Minimum amount filter (0 = no filter).
+  const [minAmount, setMinAmount] = useState(0)
 
   const load = () => {
     setLoading(true)
@@ -19,20 +23,26 @@ export default function Review() {
       .reviewQueue()
       .then((d) => {
         setQueue(d.transactions)
-        // Pre-select the suggestion if present, else keep the current category
-        // (so "Save All" without edits is a safe no-op, not a mass-relabel).
+        // Default priority: confident suggestion → current (non-Misc) category →
+        // unselected (""), so nothing is saved unless the user picks it.
         const init = {}
         d.transactions.forEach((t) => {
-          init[t.id] =
-            t.suggested_category && CATEGORIES.includes(t.suggested_category)
-              ? t.suggested_category
-              : CATEGORIES.includes(t.category)
-              ? t.category
-              : 'Miscellaneous'
+          if (
+            t.suggested_category &&
+            CATEGORIES.includes(t.suggested_category) &&
+            (t.confidence || 0) >= 0.7
+          ) {
+            init[t.id] = t.suggested_category
+          } else if (t.category && t.category !== 'Miscellaneous' && CATEGORIES.includes(t.category)) {
+            init[t.id] = t.category
+          } else {
+            init[t.id] = ''
+          }
         })
         setChoices(init)
         setConfirmed({})
         setLeaving({})
+        setTouched(new Set())
       })
       .finally(() => setLoading(false))
   }
@@ -41,16 +51,26 @@ export default function Review() {
     load()
   }, [])
 
-  const visible = useMemo(
+  // Rows still awaiting review (ignoring the amount filter).
+  const pending = useMemo(
     () => queue.filter((t) => !confirmed[t.id]),
     [queue, confirmed]
+  )
+  // Rows actually shown (after the amount filter).
+  const visible = useMemo(
+    () => pending.filter((t) => !minAmount || t.amount >= minAmount),
+    [pending, minAmount]
   )
 
   const total = queue.length
   const reviewedCount = Object.keys(confirmed).length
   const pct = total ? Math.round((reviewedCount / total) * 100) : 0
 
-  const setChoice = (id, cat) => setChoices((c) => ({ ...c, [id]: cat }))
+  const markTouched = (id) => setTouched((s) => new Set(s).add(id))
+  const setChoice = (id, cat) => {
+    setChoices((c) => ({ ...c, [id]: cat }))
+    markTouched(id)
+  }
 
   // Animate a card out, then mark it confirmed (removed from the list).
   const animateOut = (ids) => {
@@ -65,6 +85,7 @@ export default function Review() {
   const confirmOne = async (id) => {
     const category = choices[id]
     if (!category) return
+    markTouched(id)
     try {
       await api.bulkCategorize([{ id, category }])
       animateOut([id])
@@ -73,8 +94,11 @@ export default function Review() {
     }
   }
 
-  const saveAll = async () => {
-    const items = visible.map((t) => ({ id: t.id, category: choices[t.id] }))
+  // Only save rows the user explicitly touched AND that have a category chosen.
+  const saveReviewed = async () => {
+    const items = visible
+      .filter((t) => touched.has(t.id) && choices[t.id])
+      .map((t) => ({ id: t.id, category: choices[t.id] }))
     if (!items.length) return
     setSaving(true)
     try {
@@ -89,8 +113,8 @@ export default function Review() {
 
   if (loading) return <Loading />
 
-  // Empty / all-done state.
-  if (total === 0 || visible.length === 0) {
+  // Empty / all-done state (only when nothing is left to review at all).
+  if (total === 0 || pending.length === 0) {
     return (
       <div className="flex min-h-[60vh] flex-col items-center justify-center gap-4 text-center">
         <div className="flex h-24 w-24 items-center justify-center rounded-full bg-green/15 text-5xl">
@@ -122,6 +146,23 @@ export default function Review() {
         </div>
       </div>
 
+      {/* Amount filter */}
+      <div className="mb-4">
+        <input
+          type="number"
+          placeholder="Min ₹ amount"
+          value={minAmount || ''}
+          onChange={(e) => setMinAmount(Number(e.target.value) || 0)}
+          className="w-44 rounded-md border border-border bg-bg px-3 py-2 font-data text-sm text-text placeholder:text-muted"
+        />
+      </div>
+
+      {visible.length === 0 && (
+        <p className="mb-4 font-data text-sm text-muted">
+          No transactions ≥ ₹{formatINR(minAmount)} — lower the minimum to see more.
+        </p>
+      )}
+
       <div className="grid grid-cols-1 gap-3">
         {visible.map((t) => {
           const isLeaving = leaving[t.id]
@@ -149,10 +190,11 @@ export default function Review() {
 
               <div className="mt-3 flex items-center gap-3">
                 <select
-                  value={choices[t.id] || 'Miscellaneous'}
+                  value={choices[t.id] || ''}
                   onChange={(e) => setChoice(t.id, e.target.value)}
                   className="flex-1 rounded-md border border-border bg-bg px-3 py-2 font-sora text-sm text-text"
                 >
+                  <option value="">-- Select --</option>
                   {CATEGORIES.map((c) => (
                     <option key={c} value={c}>
                       {c}
@@ -161,9 +203,16 @@ export default function Review() {
                 </select>
                 <button
                   onClick={() => confirmOne(t.id)}
-                  className="rounded-md border border-green/50 bg-green/10 px-4 py-2 font-sora text-sm text-green hover:bg-green/20"
+                  disabled={!choices[t.id]}
+                  className="rounded-md border border-green/50 bg-green/10 px-4 py-2 font-sora text-sm text-green hover:bg-green/20 disabled:opacity-40"
                 >
                   ✓ Confirm
+                </button>
+                <button
+                  onClick={() => animateOut([t.id])}
+                  className="rounded-md border border-border bg-card px-4 py-2 font-sora text-sm text-muted hover:text-text"
+                >
+                  Skip
                 </button>
               </div>
             </div>
@@ -171,18 +220,18 @@ export default function Review() {
         })}
       </div>
 
-      {/* Sticky Save All */}
+      {/* Sticky save — only persists rows you actually reviewed. */}
       <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-bg/95 backdrop-blur">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-6 py-4">
           <span className="font-data text-sm text-muted">
-            {visible.length} pending · selections ready to save
+            {pending.length} pending · {touched.size} reviewed
           </span>
           <button
-            onClick={saveAll}
-            disabled={saving || visible.length === 0}
+            onClick={saveReviewed}
+            disabled={saving || touched.size === 0}
             className="rounded-md border border-accent/50 bg-accent/15 px-6 py-2 font-sora text-sm font-600 text-accent hover:bg-accent/25 disabled:opacity-40"
           >
-            {saving ? 'Saving…' : `Save All (${visible.length})`}
+            {saving ? 'Saving…' : `Save Reviewed (${touched.size})`}
           </button>
         </div>
       </div>

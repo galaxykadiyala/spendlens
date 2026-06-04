@@ -55,10 +55,16 @@ SKIP_KEYWORDS = [
     "opening balance", "closing balance", "total amount due", "minimum amount due",
     "reward points", "previous balance", "available credit", "credit limit",
     "statement summary", "amount due", "finance charge summary",
+    "petro surcharge waiver", "fuel surcharge waiver", "surcharge waiver",
+    "mer emi", "consolidated fcy markup", "rent surcharge fee",
+    "rent transaction fee", "renewal membership fee", "imps pmt", "online trf - pymt",
 ]
 
 # Bank detection markers, checked across the first 3 pages (upper-cased text).
 DETECTION = {
+    # Year End statements (different layout) must be matched before the monthly
+    # HDFC markers, which also appear in these files.
+    "HDFC Year End":     ["YEAR END STATEMENT"],
     "HDFC Diners Black": ["DINERS BLACK CREDIT CARD", "DINERS BLACK"],
     "HDFC Swiggy":       ["SWIGGY HDFC BANK CREDIT CARD"],
     "HSBC Live+":        ["HSBC LIVE+ CREDIT CARD", "HSBC LIVE+"],
@@ -408,6 +414,67 @@ def parse_hdfc(pdf, card, statement_year):
                 "card": card,
             })
     return dedup(rows)
+
+
+# HDFC Year End statement: "DD-Mon-YYYY <desc> <amount> DR|CR <card no>".
+# DR/CR is a separate column (not an amount suffix); CR rows are skipped.
+_HDFC_YE_DATE_RE = re.compile(
+    r'^(\d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{4})'
+    r'\s+(.+?)\s+([\d,]+\.\d{2})\s+(DR|CR)',
+    re.IGNORECASE,
+)
+
+
+def parse_hdfc_yearend(pdf, card, statement_year):
+    """HDFC Year End statement (annual, different layout from monthly).
+
+    Card name is inferred from the card number present in the full text.
+    """
+    transactions = []
+    full_text = ""
+    for page in pdf.pages:
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            continue
+        full_text += text
+        for line in text.splitlines():
+            m = _HDFC_YE_DATE_RE.match(line.strip())
+            if not m:
+                continue
+            date_str, desc_raw, amount_str, dr_cr = m.groups()
+            if dr_cr.upper() == "CR":
+                continue
+            if should_skip(desc_raw):
+                continue
+            date = parse_date(date_str, statement_year)
+            if not date:
+                continue
+            amount = float(amount_str.replace(",", ""))
+            if amount <= 0:
+                continue
+            desc = clean_description(re.sub(r'\s+[A-Z]{4,}$', '', desc_raw).strip())
+            if not desc:
+                continue
+            transactions.append({
+                "date": date,
+                "description": desc,
+                "raw_description": line.strip(),
+                "amount": amount,
+                "card": card,
+            })
+
+    # Override the card name based on the card number in the statement.
+    if "360886" in full_text:
+        inferred = "HDFC Diners Black"
+    elif "526873" in full_text:
+        inferred = "HDFC Swiggy"
+    else:
+        inferred = "HDFC"
+    for t in transactions:
+        t["card"] = inferred
+
+    return dedup(transactions)
 
 
 def parse_hsbc(pdf, card, statement_year):
@@ -1026,6 +1093,7 @@ def parse_generic(pdf, card, statement_year):
 
 
 CARD_PARSER = {
+    "HDFC Year End": parse_hdfc_yearend,
     "HDFC Diners Black": parse_hdfc,
     "HDFC Swiggy": parse_hdfc,
     "HSBC Live+": parse_hsbc,
@@ -1343,7 +1411,7 @@ def detect_and_parse(pdf_path):
             "description": desc,
             "raw_description": r.get("raw_description", desc),
             "amount": r["amount"],
-            "card": card,
+            "card": r.get("card", card),  # honor parser-inferred card (e.g. HDFC Year End)
             "category": cat["category"],
             "confidence": cat["confidence"],
             "suggested_category": "",

@@ -73,3 +73,13 @@ export function formatINR(n, withDecimals = false) {
     minimumFractionDigits: withDecimals ? 2 : 0,
   })
 }
+
+// Display helper: "2024-04" → "Apr 2024". DISPLAY ONLY — never send to the API.
+export function formatMonth(yyyymm) {
+  if (!yyyymm) return ''
+  const [year, month] = yyyymm.split('-')
+  return new Date(year, parseInt(month) - 1).toLocaleString('en-IN', {
+    month: 'short',
+    year: 'numeric',
+  })
+}

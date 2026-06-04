@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, formatINR, colorFor, CATEGORIES } from '../api'
+import { api, formatINR, colorFor, CATEGORIES, formatMonth } from '../api'
 import { Card, PageHeader, Loading, EmptyState } from '../components/Common'
 
 export default function Transactions() {
@@ -172,7 +172,7 @@ export default function Transactions() {
             className="rounded-md border border-border bg-bg px-3 py-2 font-data text-sm text-text"
           >
             <option value="">All months</option>
-            {months.map((m) => (<option key={m} value={m}>{m}</option>))}
+            {months.map((m) => (<option key={m} value={m}>{formatMonth(m)}</option>))}
           </select>
         </div>
         <div className="mt-4 flex items-center gap-3">

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, formatINR } from '../api'
+import { api, formatINR, formatMonth } from '../api'
 import StatCard from '../components/StatCard'
 import { Card, PageHeader, Loading, EmptyState, InsightCard } from '../components/Common'
 import { DonutChart, IncomeSpendBar } from '../components/Charts'
@@ -83,7 +83,7 @@ export default function Overview() {
     <>
       <PageHeader
         title="Overview"
-        subtitle={`${fromMonth} → ${toMonth} · ${view.n} month${view.n === 1 ? '' : 's'} · ${summary.card_count} cards`}
+        subtitle={`${formatMonth(fromMonth)} → ${formatMonth(toMonth)} · ${view.n} month${view.n === 1 ? '' : 's'} · ${summary.card_count} cards`}
       >
         <label className="font-data text-xs text-muted">From</label>
         <select
@@ -91,7 +91,7 @@ export default function Overview() {
           onChange={(e) => setFromMonth(e.target.value)}
           className="rounded-md border border-border bg-bg px-2 py-1 font-data text-xs text-text"
         >
-          {months.map((m) => (<option key={m} value={m}>{m}</option>))}
+          {months.map((m) => (<option key={m} value={m}>{formatMonth(m)}</option>))}
         </select>
         <label className="font-data text-xs text-muted">To</label>
         <select
@@ -99,7 +99,7 @@ export default function Overview() {
           onChange={(e) => setToMonth(e.target.value)}
           className="rounded-md border border-border bg-bg px-2 py-1 font-data text-xs text-text"
         >
-          {months.map((m) => (<option key={m} value={m}>{m}</option>))}
+          {months.map((m) => (<option key={m} value={m}>{formatMonth(m)}</option>))}
         </select>
       </PageHeader>
 
@@ -145,7 +145,7 @@ export default function Overview() {
             <tbody>
               {view.rows.map((r) => (
                 <tr key={r.month} className="border-b border-border/50">
-                  <td className="px-3 py-2 text-left font-data text-sm text-text">{r.month}</td>
+                  <td className="px-3 py-2 text-left font-data text-sm text-text">{formatMonth(r.month)}</td>
                   <td className="px-3 py-2 text-right font-data text-sm text-text">₹{formatINR(r.total)}</td>
                   <td className="px-3 py-2 text-right font-data text-sm">
                     {r.delta == null ? (

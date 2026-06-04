@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, formatINR, colorFor } from '../api'
+import { api, formatINR, colorFor, formatMonth } from '../api'
 import { Card, PageHeader, Loading, EmptyState } from '../components/Common'
 import { StackedAreaChart } from '../components/Charts'
 
@@ -64,7 +64,7 @@ export default function Monthly() {
           onChange={(e) => setStartMonth(e.target.value)}
           className="rounded-md border border-border bg-bg px-2 py-1 font-data text-xs text-text"
         >
-          {months.map((m) => (<option key={m} value={m}>{m}</option>))}
+          {months.map((m) => (<option key={m} value={m}>{formatMonth(m)}</option>))}
         </select>
         <label className="font-data text-xs text-muted">To</label>
         <select
@@ -72,16 +72,16 @@ export default function Monthly() {
           onChange={(e) => setEndMonth(e.target.value)}
           className="rounded-md border border-border bg-bg px-2 py-1 font-data text-xs text-text"
         >
-          {months.map((m) => (<option key={m} value={m}>{m}</option>))}
+          {months.map((m) => (<option key={m} value={m}>{formatMonth(m)}</option>))}
         </select>
       </PageHeader>
 
       <Card title="Spend by Category">
-        <StackedAreaChart data={chartData} categories={categories} onMonthClick={loadMonth} />
+        <StackedAreaChart data={chartData} categories={categories} onMonthClick={loadMonth} xTickFormatter={formatMonth} />
       </Card>
 
       {selectedMonth && (
-        <Card title={`Transactions — ${selectedMonth}`} className="mt-6">
+        <Card title={`Transactions — ${formatMonth(selectedMonth)}`} className="mt-6">
           {monthTxns.length === 0 ? (
             <p className="font-data text-sm text-muted">No transactions for this month.</p>
           ) : (

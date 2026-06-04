@@ -69,8 +69,9 @@ export function HorizontalBarChart({ data, dataKey = 'total', nameKey = 'name', 
   )
 }
 
-export function StackedAreaChart({ data, categories, onMonthClick, height = 380 }) {
-  // data: [{ month, <cat>: total, ... , __total }]
+export function StackedAreaChart({ data, categories, onMonthClick, height = 380, xTickFormatter }) {
+  // data: [{ month, <cat>: total, ... , __total }]. xTickFormatter is DISPLAY-only;
+  // onMonthClick still receives the raw month value (e.activeLabel).
   return (
     <ResponsiveContainer width="100%" height={height}>
       <ComposedChart
@@ -80,7 +81,7 @@ export function StackedAreaChart({ data, categories, onMonthClick, height = 380 
         }}
       >
         <CartesianGrid stroke={GRID} />
-        <XAxis dataKey="month" tick={AXIS} />
+        <XAxis dataKey="month" tick={AXIS} tickFormatter={xTickFormatter} />
         <YAxis tick={AXIS} tickFormatter={(v) => `₹${formatINR(v)}`} />
         <Tooltip content={<TooltipBox />} />
         {categories.map((cat, i) => (

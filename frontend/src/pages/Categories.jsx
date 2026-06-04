@@ -17,6 +17,7 @@ export default function Categories() {
   const [summary, setSummary] = useState(null)
   const [loading, setLoading] = useState(true)
   const [range, setRange] = useState('all')
+  const [selectedMonth, setSelectedMonth] = useState('')
   const [sortKey, setSortKey] = useState('total')
   const [sortDir, setSortDir] = useState('desc')
 
@@ -44,53 +45,65 @@ export default function Categories() {
     () => [...new Set(monthly.map((r) => r.month))].sort(),
     [monthly]
   )
+  // Newest-first list for the month dropdown.
+  const monthsDesc = useMemo(() => [...allMonths].reverse(), [allMonths])
 
-  // Category rows for the active range, plus the human-readable range label.
+  // Category rows for the active scope (single month > range pills > all).
   const { cats, rangeLabel } = useMemo(() => {
-    if (range === 'all') {
+    const income = summary?.monthly_income || 0
+    // Per-category per-month totals across ALL data (for totals + MoM).
+    const catMonth = {}
+    for (const r of monthly) {
+      catMonth[r.category] = catMonth[r.category] || {}
+      catMonth[r.category][r.month] = (catMonth[r.category][r.month] || 0) + r.total
+    }
+
+    // Build category rows for a given (ascending) list of months in scope.
+    const buildRows = (monthsInScope) => {
+      const last = monthsInScope[monthsInScope.length - 1]
+      const prev = last ? allMonths[allMonths.indexOf(last) - 1] : undefined
+      const scope = new Set(monthsInScope)
+      const totals = {}
+      for (const r of monthly) {
+        if (scope.has(r.month)) totals[r.category] = (totals[r.category] || 0) + r.total
+      }
+      const grand = Object.values(totals).reduce((a, b) => a + b, 0) || 1
+      const incomeBase = income * (monthsInScope.length || 1)
+      return Object.entries(totals)
+        .map(([category, total]) => {
+          const cur = (catMonth[category] && catMonth[category][last]) || 0
+          const pv = prev ? (catMonth[category] && catMonth[category][prev]) || 0 : 0
+          let mom = null
+          if (prev) mom = pv > 0 ? ((cur - pv) / pv) * 100 : cur > 0 ? 100 : 0
+          return {
+            category,
+            total: Math.round(total * 100) / 100,
+            pct_of_total: Math.round((total / grand) * 1000) / 10,
+            pct_of_income: incomeBase ? Math.round((total / incomeBase) * 1000) / 10 : 0,
+            mom_change: mom == null ? null : Math.round(mom * 10) / 10,
+          }
+        })
+        .sort((a, b) => b.total - a.total)
+    }
+
+    // A specific month overrides the range pills.
+    if (selectedMonth) {
+      return { cats: buildRows([selectedMonth]), rangeLabel: formatMonth(selectedMonth) }
+    }
+    // No range (or 'all') → use the server's all-time category data unchanged.
+    if (range === 'all' || !range) {
       const lbl = allMonths.length
         ? `${formatMonth(allMonths[0])} – ${formatMonth(allMonths[allMonths.length - 1])}`
         : ''
       return { cats: apiCats, rangeLabel: lbl }
     }
-
-    const income = summary?.monthly_income || 0
+    // A range pill → window of months.
     const rangeMonths = allMonths.filter((m) => m >= startMonth)
-    // Per-category per-month totals across ALL data (for MoM).
-    const catMonth = {}
-    const totals = {}
-    for (const r of monthly) {
-      catMonth[r.category] = catMonth[r.category] || {}
-      catMonth[r.category][r.month] = (catMonth[r.category][r.month] || 0) + r.total
-      if (r.month >= startMonth) totals[r.category] = (totals[r.category] || 0) + r.total
-    }
-    const last = rangeMonths[rangeMonths.length - 1]
-    const prev = last ? allMonths[allMonths.indexOf(last) - 1] : undefined
-    const grand = Object.values(totals).reduce((a, b) => a + b, 0) || 1
-    const numMonths = rangeMonths.length || 1
-    const incomeBase = income * numMonths
-
-    const rows = Object.entries(totals)
-      .map(([category, total]) => {
-        const cur = (catMonth[category] && catMonth[category][last]) || 0
-        const pv = prev ? (catMonth[category] && catMonth[category][prev]) || 0 : 0
-        let mom = null
-        if (prev) mom = pv > 0 ? ((cur - pv) / pv) * 100 : cur > 0 ? 100 : 0
-        return {
-          category,
-          total: Math.round(total * 100) / 100,
-          pct_of_total: Math.round((total / grand) * 1000) / 10,
-          pct_of_income: incomeBase ? Math.round((total / incomeBase) * 1000) / 10 : 0,
-          mom_change: mom == null ? null : Math.round(mom * 10) / 10,
-        }
-      })
-      .sort((a, b) => b.total - a.total)
-
     const lbl = rangeMonths.length
-      ? `${formatMonth(rangeMonths[0])} – ${formatMonth(last)}`
+      ? `${formatMonth(rangeMonths[0])} – ${formatMonth(rangeMonths[rangeMonths.length - 1])}`
       : 'No data in this range'
-    return { cats: rows, rangeLabel: lbl }
-  }, [range, apiCats, monthly, summary, startMonth, allMonths])
+    return { cats: buildRows(rangeMonths), rangeLabel: lbl }
+  }, [selectedMonth, range, apiCats, monthly, summary, startMonth, allMonths])
 
   const sorted = useMemo(() => {
     const arr = [...cats]
@@ -133,16 +146,22 @@ export default function Categories() {
 
   return (
     <>
-      <PageHeader title="Categories" subtitle={rangeLabel} />
+      <PageHeader
+        title="Categories"
+        subtitle={selectedMonth ? `${cats.length} categories · ${formatMonth(selectedMonth)}` : rangeLabel}
+      />
 
-      {/* Range pills */}
-      <div className="mb-4 flex flex-wrap gap-2">
+      {/* Range pills + single-month selector */}
+      <div className="mb-4 flex flex-wrap items-center gap-2">
         {RANGES.map((r) => (
           <button
             key={r.key}
-            onClick={() => setRange(r.key)}
+            onClick={() => {
+              setRange(r.key)
+              setSelectedMonth('')
+            }}
             className={`rounded-full px-3 py-1 font-sora text-xs transition-colors ${
-              range === r.key
+              range === r.key && !selectedMonth
                 ? 'border border-accent/50 bg-accent/15 text-accent'
                 : 'border border-border text-muted hover:text-text'
             }`}
@@ -150,6 +169,24 @@ export default function Categories() {
             {r.label}
           </button>
         ))}
+        <select
+          value={selectedMonth}
+          onChange={(e) => {
+            const m = e.target.value
+            setSelectedMonth(m)
+            setRange(m ? '' : 'all')
+          }}
+          className={`rounded-full border px-3 py-1 font-sora text-xs ${
+            selectedMonth ? 'border-accent/50 bg-accent/15 text-accent' : 'border-border bg-bg text-muted'
+          }`}
+        >
+          <option value="">-- Pick month --</option>
+          {monthsDesc.map((m) => (
+            <option key={m} value={m}>
+              {formatMonth(m)}
+            </option>
+          ))}
+        </select>
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-5">

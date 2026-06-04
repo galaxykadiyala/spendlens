@@ -20,6 +20,9 @@ export default function Categories() {
   const [selectedMonth, setSelectedMonth] = useState('')
   const [sortKey, setSortKey] = useState('total')
   const [sortDir, setSortDir] = useState('desc')
+  const [expanded, setExpanded] = useState('')
+  const [catTxns, setCatTxns] = useState([])
+  const [catTxnsLoading, setCatTxnsLoading] = useState(false)
 
   useEffect(() => {
     Promise.all([api.categories(), api.monthly(), api.summary()])
@@ -116,6 +119,15 @@ export default function Categories() {
     return arr
   }, [cats, sortKey, sortDir])
 
+  // Fetch transactions for the expanded category whenever it changes.
+  useEffect(() => {
+    if (!expanded) { setCatTxns([]); return }
+    setCatTxnsLoading(true)
+    api.transactions({ category: expanded, per_page: 200, sort: 'amount', dir: 'DESC' })
+      .then((d) => setCatTxns(d.transactions))
+      .finally(() => setCatTxnsLoading(false))
+  }, [expanded])
+
   if (loading) return <Loading />
   if (!apiCats.length) return (<><PageHeader title="Categories" /><EmptyState /></>)
 
@@ -211,24 +223,81 @@ export default function Categories() {
                 </tr>
               </thead>
               <tbody>
-                {sorted.map((c) => (
-                  <tr key={c.category} className={`border-b border-border/50 ${rowBg(c.pct_of_income)}`}>
-                    <td className="px-3 py-2 text-left font-sora text-sm text-text">{c.category}</td>
-                    <td className="px-3 py-2 text-right text-sm text-text">₹{formatINR(c.total)}</td>
-                    <td className="px-3 py-2 text-right text-sm text-muted">{c.pct_of_total}%</td>
-                    <td className="px-3 py-2 text-right text-sm text-muted">{c.pct_of_income}%</td>
-                    <td className="px-3 py-2 text-right text-sm">
-                      {c.mom_change == null ? (
-                        <span className="text-muted">—</span>
-                      ) : (
-                        <span className={c.mom_change > 0 ? 'text-red' : c.mom_change < 0 ? 'text-green' : 'text-muted'}>
-                          {c.mom_change > 0 ? '+' : ''}
-                          {c.mom_change}%
-                        </span>
+                {sorted.map((c) => {
+                  const isOpen = expanded === c.category
+                  const txnSum = catTxns.reduce((a, t) => a + (t.amount || 0), 0)
+                  return (
+                    <>
+                      <tr
+                        key={c.category}
+                        onClick={() => setExpanded(isOpen ? '' : c.category)}
+                        className={`cursor-pointer border-b border-border/50 hover:bg-accent/5 ${rowBg(c.pct_of_income)}`}
+                      >
+                        <td className="px-3 py-2 text-left font-sora text-sm text-text">
+                          <span className={`mr-2 inline-block text-xs text-muted transition-transform duration-200 ${isOpen ? 'rotate-90' : ''}`}>▶</span>
+                          {c.category}
+                        </td>
+                        <td className="px-3 py-2 text-right text-sm text-text">₹{formatINR(c.total)}</td>
+                        <td className="px-3 py-2 text-right text-sm text-muted">{c.pct_of_total}%</td>
+                        <td className="px-3 py-2 text-right text-sm text-muted">{c.pct_of_income}%</td>
+                        <td className="px-3 py-2 text-right text-sm">
+                          {c.mom_change == null ? (
+                            <span className="text-muted">—</span>
+                          ) : (
+                            <span className={c.mom_change > 0 ? 'text-red' : c.mom_change < 0 ? 'text-green' : 'text-muted'}>
+                              {c.mom_change > 0 ? '+' : ''}
+                              {c.mom_change}%
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                      {isOpen && (
+                        <tr key={`${c.category}-txns`} className="border-b border-border/50">
+                          <td colSpan={5} className="p-0">
+                            <div className="bg-bg/60 px-4 py-3">
+                              {catTxnsLoading ? (
+                                <p className="font-data text-xs text-muted">Loading…</p>
+                              ) : (
+                                <>
+                                  <p className="mb-2 font-data text-xs text-muted">
+                                    {catTxns.length} transactions · ₹{formatINR(txnSum)}
+                                  </p>
+                                  <div className="max-h-96 overflow-y-auto rounded-md border border-border">
+                                    <table className="w-full border-collapse">
+                                      <thead>
+                                        <tr className="sticky top-0 border-b border-border bg-card">
+                                          <th className="px-3 py-1.5 text-left text-xs uppercase tracking-wider text-muted">Date</th>
+                                          <th className="px-3 py-1.5 text-left text-xs uppercase tracking-wider text-muted">Description</th>
+                                          <th className="px-3 py-1.5 text-right text-xs uppercase tracking-wider text-muted">Amount</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {catTxns.map((t) => (
+                                          <tr key={t.id} className="border-b border-border/40">
+                                            <td className="px-3 py-1.5 font-data text-xs text-muted">{t.date}</td>
+                                            <td className="px-3 py-1.5 font-sora text-xs text-text">{t.description}</td>
+                                            <td className="px-3 py-1.5 text-right font-data text-xs text-text">₹{formatINR(t.amount)}</td>
+                                          </tr>
+                                        ))}
+                                        {catTxns.length === 0 && (
+                                          <tr>
+                                            <td colSpan={3} className="px-3 py-4 text-center font-data text-xs text-muted">
+                                              No transactions found.
+                                            </td>
+                                          </tr>
+                                        )}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
                       )}
-                    </td>
-                  </tr>
-                ))}
+                    </>
+                  )
+                })}
                 {sorted.length === 0 && (
                   <tr>
                     <td colSpan={5} className="px-3 py-6 text-center font-data text-sm text-muted">

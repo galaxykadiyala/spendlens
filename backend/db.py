@@ -338,7 +338,11 @@ def get_review_queue():
             "SELECT id, date, description, amount, card, category, "
             "suggested_category, confidence "
             "FROM transactions "
-            "WHERE category = 'Miscellaneous' OR confidence < 0.7 "
+            "WHERE excluded = 0 "
+            "AND ( "
+            "    (category = 'Miscellaneous' AND confidence < 1.0) "
+            "    OR (confidence < 0.7 AND category != 'Miscellaneous') "
+            ") "
             "ORDER BY amount DESC, id DESC"
         )
         return [dict(r) for r in cur.fetchall()]
@@ -354,7 +358,7 @@ def low_confidence_transactions(threshold=0.0):
     conn = connect()
     try:
         cur = conn.execute(
-            "SELECT id, description FROM transactions WHERE confidence <= ?",
+            "SELECT id, description FROM transactions WHERE confidence <= ? AND excluded = 0",
             (float(threshold),),
         )
         return [dict(r) for r in cur.fetchall()]
